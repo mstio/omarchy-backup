@@ -1,0 +1,7 @@
+[Unit]
+Description=omarchy-backup: automatic compatibility check (doctor)
+ConditionPathExists=%h/.config/omarchy-backup/config.conf
+
+[Service]
+Type=oneshot
+ExecStart=@EXEC@ doctor --auto

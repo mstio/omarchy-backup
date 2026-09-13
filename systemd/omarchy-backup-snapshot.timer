@@ -1,0 +1,10 @@
+[Unit]
+Description=omarchy-backup: automatic snapshot timer
+
+[Timer]
+OnCalendar=@ONCALENDAR_SNAPSHOT@
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

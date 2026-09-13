@@ -1,0 +1,193 @@
+#!/bin/bash
+# omarchy-backup: snapshot / baseline / drift / backup / restore / doctor
+# for a personal Omarchy workspace. See README.md.
+set -uo pipefail
+# Deliberately no `set -e`: this tool relies throughout on
+# `[ cond ] && action` / `A || B` idioms and while-loops whose last command
+# can legitimately be "false" (e.g. no match found) without that meaning the
+# enclosing function failed. `errexit` interacts with function return codes
+# in ways that made those idioms abort the whole run unpredictably: bash
+# only exempts such a construct from -e at the exact call site, not when a
+# function's *last* statement is one and the function is later called as a
+# bare command. Real failures are instead checked explicitly and reported
+# via ob_die/ob_warn.
+
+OB_SELF="${BASH_SOURCE[0]}"
+# Resolve our own path through any symlink (e.g. ~/.local/bin/omarchy-backup
+# -> the checkout's bin/omarchy-backup) so lib/ is found relative to the
+# real script location, not the symlink's directory.
+while [ -L "$OB_SELF" ]; do
+  link="$(readlink -- "$OB_SELF")"
+  case "$link" in
+    /*) OB_SELF="$link" ;;
+    *) OB_SELF="$(dirname -- "$OB_SELF")/$link" ;;
+  esac
+done
+OB_BIN_DIR="$(cd -- "$(dirname -- "$OB_SELF")" && pwd)"
+OB_LIB_DIR_BOOT="$(cd -- "$OB_BIN_DIR/../lib" && pwd)"
+
+# shellcheck source=lib/common.sh
+source "$OB_LIB_DIR_BOOT/common.sh"
+# shellcheck source=lib/inventory.sh
+source "$OB_LIB_DIR_BOOT/inventory.sh"
+# shellcheck source=lib/manifest.sh
+source "$OB_LIB_DIR_BOOT/manifest.sh"
+# shellcheck source=lib/snapshot.sh
+source "$OB_LIB_DIR_BOOT/snapshot.sh"
+# shellcheck source=lib/baseline.sh
+source "$OB_LIB_DIR_BOOT/baseline.sh"
+# shellcheck source=lib/remote.sh
+source "$OB_LIB_DIR_BOOT/remote.sh"
+# shellcheck source=lib/restore.sh
+source "$OB_LIB_DIR_BOOT/restore.sh"
+# shellcheck source=lib/doctor.sh
+source "$OB_LIB_DIR_BOOT/doctor.sh"
+# shellcheck source=lib/timers.sh
+source "$OB_LIB_DIR_BOOT/timers.sh"
+# shellcheck source=lib/config.sh
+source "$OB_LIB_DIR_BOOT/config.sh"
+
+ob_usage() {
+  cat <<'EOF'
+omarchy-backup -- freeze and restore your personal Omarchy workspace.
+
+Usage:
+  omarchy-backup snapshot [name] [--baseline] [--replace NAME] [--auto]
+  omarchy-backup list
+  omarchy-backup show <name>
+  omarchy-backup baseline <name>
+  omarchy-backup status
+  omarchy-backup push <name>
+  omarchy-backup remote-list
+  omarchy-backup pull <name>
+  omarchy-backup restore <name> [--dry-run] [--from-remote]
+  omarchy-backup doctor [--auto]
+  omarchy-backup timers install|status|uninstall
+  omarchy-backup config list|get <KEY>|set <KEY> <VALUE>
+  omarchy-backup init
+
+Config:      ~/.config/omarchy-backup/config.conf
+Path rules:  ~/.config/omarchy-backup/paths.conf (+ paths.d/*.conf)
+Data:        ~/.local/share/omarchy-backup/{snapshots,state.json}
+EOF
+}
+
+ob_cmd_init() {
+  ob_ensure_dirs
+  ob_write_default_config
+  ob_write_default_paths
+  ob_state_init_if_missing
+  ob_info "Initialized. Edit $OB_CONFIG_FILE and $OB_PATHS_FILE, then run 'omarchy-backup snapshot'."
+}
+
+ob_cmd_snapshot() {
+  local name="" auto=false
+  OB_MARK_BASELINE=false
+  OB_REPLACE_NAME=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --baseline) OB_MARK_BASELINE=true ;;
+      --replace) shift; OB_REPLACE_NAME="${1:-}" ;;
+      --auto) auto=true ;;
+      -*) ob_die "Unknown option: $1" ;;
+      *) name="$1" ;;
+    esac
+    shift
+  done
+  export OB_MARK_BASELINE OB_REPLACE_NAME
+  OB_AUTO_MODE="$auto"
+
+  ob_load_config
+  if [ "$auto" = "true" ]; then
+    if [ "$OB_CFG_ENABLED" != "true" ]; then
+      ob_info "Automatic backups disabled (OB_CFG_ENABLED=false); skipping."
+      return 0
+    fi
+    # Trigger an out-of-cycle doctor run if Omarchy itself was updated since
+    # we last looked -- catches "decay" promptly instead of waiting for the
+    # monthly doctor timer.
+    local last_seen current
+    last_seen="$(ob_state_read | jq -r '.last_seen_omarchy_version // empty')"
+    current="$(ob_inv_omarchy_version)"
+    if [ -n "$last_seen" ] && [ "$last_seen" != "$current" ]; then
+      ob_info "Omarchy version changed ($last_seen -> $current); running doctor before snapshotting."
+      ob_doctor_run true || true
+    fi
+    if [ "$OB_CFG_SKIP_AUTO_IF_CLEAN" = "true" ]; then
+      local color; color="$(ob_status_color_only)"
+      if [ "$color" = "GREEN" ]; then
+        ob_info "No drift since baseline (GREEN); skipping automatic snapshot."
+        return 0
+      fi
+    fi
+  fi
+  OB_SNAPSHOT_NAME="$name"
+  export OB_SNAPSHOT_NAME
+  ob_snapshot_create
+}
+
+main() {
+  [ $# -eq 0 ] && { ob_usage; exit 1; }
+  local cmd="$1"; shift || true
+  case "$cmd" in
+    init) ob_cmd_init "$@" ;;
+    snapshot) ob_cmd_snapshot "$@" ;;
+    list) ob_snapshot_list ;;
+    show)
+      [ $# -ge 1 ] || ob_die "Usage: omarchy-backup show <name>"
+      ob_ensure_dirs; ob_snapshot_show "$1" ;;
+    baseline)
+      [ $# -ge 1 ] || ob_die "Usage: omarchy-backup baseline <name>"
+      ob_ensure_dirs; ob_baseline_mark "$1" ;;
+    status) ob_status ;;
+    push)
+      [ $# -ge 1 ] || ob_die "Usage: omarchy-backup push <name>"
+      ob_ensure_dirs; ob_load_config; ob_remote_push "$1" ;;
+    remote-list) ob_ensure_dirs; ob_load_config; ob_remote_list ;;
+    pull)
+      [ $# -ge 1 ] || ob_die "Usage: omarchy-backup pull <name>"
+      ob_ensure_dirs; ob_load_config; ob_remote_pull "$1" ;;
+    restore)
+      [ $# -ge 1 ] || ob_die "Usage: omarchy-backup restore <name> [--dry-run] [--from-remote]"
+      local name="$1"; shift
+      OB_DRY_RUN=false
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --dry-run) OB_DRY_RUN=true ;;
+          --from-remote) : ;; # ob_restore_run already falls back to remote automatically
+          *) ob_die "Unknown option: $1" ;;
+        esac
+        shift
+      done
+      export OB_DRY_RUN
+      ob_restore_run "$name" ;;
+    doctor)
+      local auto=false
+      [ "${1:-}" = "--auto" ] && auto=true
+      ob_doctor_run "$auto" ;;
+    timers)
+      [ $# -ge 1 ] || ob_die "Usage: omarchy-backup timers install|status|uninstall"
+      case "$1" in
+        install) ob_timers_install ;;
+        status) ob_timers_status ;;
+        uninstall) ob_timers_uninstall ;;
+        *) ob_die "Unknown timers subcommand: $1" ;;
+      esac ;;
+    config)
+      [ $# -ge 1 ] || ob_die "Usage: omarchy-backup config list|get <KEY>|set <KEY> <VALUE>"
+      case "$1" in
+        list) ob_config_list ;;
+        get)
+          [ $# -ge 2 ] || ob_die "Usage: omarchy-backup config get <KEY>"
+          ob_config_get "$2" ;;
+        set)
+          [ $# -ge 3 ] || ob_die "Usage: omarchy-backup config set <KEY> <VALUE>"
+          ob_config_set "$2" "$3" ;;
+        *) ob_die "Unknown config subcommand: $1" ;;
+      esac ;;
+    -h|--help|help) ob_usage ;;
+    *) ob_err "Unknown command: $cmd"; ob_usage; exit 1 ;;
+  esac
+}
+
+main "$@"

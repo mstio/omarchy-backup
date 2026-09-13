@@ -1,0 +1,75 @@
+# omarchy-backup: declarative list of reconstructable config/dotfile paths.
+#
+# One entry per line: `include <path>` or `exclude <glob>`.
+# Paths may use ~ for $HOME. Excludes are matched against the full expanded
+# path AND against the basename, so `exclude *.log` works from anywhere.
+#
+# This file is copied to ~/.config/omarchy-backup/paths.conf on first run and
+# is yours to edit. Drop additional *.conf files into
+# ~/.config/omarchy-backup/paths.d/ instead of editing this file directly if
+# you want your customizations to survive a tool update that ships a new
+# default (paths.conf itself is never overwritten once it exists).
+#
+# This list is intentionally declarative and edited by hand rather than
+# derived by inspecting each tool's internals: when Omarchy or an agent CLI
+# reorganizes its directories, fix the entry here instead of the code
+# (see `omarchy-backup doctor`).
+
+# --- Hyprland / Omarchy shell -------------------------------------------
+include ~/.config/hypr
+include ~/.config/omarchy/backgrounds
+include ~/.config/omarchy/branding
+include ~/.config/omarchy/dock.json
+include ~/.config/omarchy/dock-pinned.json
+include ~/.config/omarchy/dock-settings.json
+include ~/.config/omarchy/omadock.json
+include ~/.config/omarchy/omasettings.json
+include ~/.config/omarchy/shell.json
+include ~/.config/omarchy/shell.toml
+include ~/.config/omarchy/hooks
+include ~/.config/omarchy/extensions
+include ~/.config/omarchy/themes
+include ~/.config/omarchy/lock-designs
+
+# Note: ~/.config/omarchy/plugins is handled separately by the plugin
+# inventory (git-managed plugins are restored via `omarchy plugin add`,
+# not by copying their tree; only non-git, self-authored plugins are
+# embedded as file content). Do not add it here.
+
+# --- User-authored scripts/tools ----------------------------------------
+include ~/.local/bin
+
+# --- Shared cross-agent knowledge / machine memory ----------------------
+include ~/.config/ai-agents
+include ~/.claude/CLAUDE.md
+include ~/.claude/settings.json
+include ~/.claude/settings.local.json
+include ~/.claude/skills
+include ~/.claude/themes
+include ~/.claude/projects/*/memory
+include ~/.codex/AGENTS.md
+include ~/.codex/config.toml
+include ~/.codex/rules
+include ~/.gemini/GEMINI.md
+include ~/.gemini/settings.json
+include ~/.gemini/config
+
+# --- Misc user config -----------------------------------------------------
+include ~/.config/mimeapps.list
+include ~/.config/user-dirs.dirs
+
+# --- systemd user units (own/hand-authored only; symlink farms excluded) --
+include ~/.config/systemd/user/*.service
+include ~/.config/systemd/user/*.timer
+include ~/.config/systemd/user/*.path
+
+# --- Always-exclude: runtime/cache/session state, never "config" ----------
+exclude *.sqlite
+exclude *.sqlite-*
+exclude *cache*
+exclude *Cache*
+exclude *.log
+exclude node_modules
+exclude .git
+exclude *~
+exclude .DS_Store

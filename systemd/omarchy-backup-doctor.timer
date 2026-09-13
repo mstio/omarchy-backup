@@ -1,0 +1,10 @@
+[Unit]
+Description=omarchy-backup: automatic compatibility check timer
+
+[Timer]
+OnCalendar=@ONCALENDAR_DOCTOR@
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target
