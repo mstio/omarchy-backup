@@ -192,12 +192,22 @@ that's the fresh-install path (see below).
 ```
 Fresh Omarchy install
   -> install rclone, git this repo (or copy it) to ~/Projects/omarchy-backup
+  -> if any of your own git-managed plugins live in a *private* repo:
+     gh auth login && gh auth setup-git   (so `omarchy plugin add` can clone them)
   -> ./install.sh
   -> edit ~/.config/omarchy-backup/config.conf (set OB_CFG_REMOTE_NAME)
   -> omarchy-backup remote-list          # see what's available
   -> omarchy-backup restore <name> --dry-run   # review the plan first
   -> omarchy-backup restore <name>
 ```
+
+Note: any plugin the manifest lists as git-managed (`plugins.git_managed` --
+this includes not just third-party plugins but your own, once you `git
+init` one) gets reinstalled via `omarchy plugin add <remote-url>` (step 2
+below). If that remote is a **private** repo, the clone needs git
+credentials for it -- run `gh auth login`/`gh auth setup-git` (or set up an
+SSH key) before restoring, or that one step is simply skipped and reported
+as a manual step at the end rather than failing the whole restore.
 
 `restore` is staged and always dry-runnable:
 
@@ -240,6 +250,11 @@ to itself (the convention already used elsewhere on this machine).
 - AppImages and Flatpak apps are only listed, not reinstalled for you.
 - A plugin's uncommitted local patch that no longer applies cleanly against
   a newer upstream commit (rare, but the diff is saved for manual review).
+- Cloning a git-managed plugin from a **private** repo (including one of
+  your own, the moment you `git init` it) -- needs git/GitHub credentials
+  set up on the fresh machine first (`gh auth login` + `gh auth setup-git`,
+  or SSH keys); otherwise that one plugin is skipped and listed as a
+  manual step rather than failing the whole restore.
 - Full bit-for-bit fidelity is explicitly a non-goal; the target is "fresh
   Omarchy -> functionally the same personal workspace."
 
