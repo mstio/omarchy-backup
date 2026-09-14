@@ -81,7 +81,7 @@ ob_cmd_init() {
 }
 
 ob_cmd_snapshot() {
-  local name="" auto=false
+  local name="" auto=false status_color=""
   OB_MARK_BASELINE=false
   OB_REPLACE_NAME=""
   while [ $# -gt 0 ]; do
@@ -113,9 +113,20 @@ ob_cmd_snapshot() {
       ob_info "Omarchy version changed ($last_seen -> $current); running doctor before snapshotting."
       ob_doctor_run true || true
     fi
+    status_color="$(ob_status_color_only)"
+    case "$status_color" in
+      RED|UNKNOWN)
+        ob_err "Status is $status_color; refusing to create or upload an automatic snapshot. Establish or repair the known-good baseline first."
+        return 1
+        ;;
+      GREEN|YELLOW) ;;
+      *)
+        ob_err "Could not determine baseline status; refusing automatic backup."
+        return 1
+        ;;
+    esac
     if [ "$OB_CFG_SKIP_AUTO_IF_CLEAN" = "true" ]; then
-      local color; color="$(ob_status_color_only)"
-      if [ "$color" = "GREEN" ]; then
+      if [ "$status_color" = "GREEN" ]; then
         ob_info "No drift since baseline (GREEN); skipping automatic snapshot."
         return 0
       fi
@@ -123,7 +134,19 @@ ob_cmd_snapshot() {
   fi
   OB_SNAPSHOT_NAME="$name"
   export OB_SNAPSHOT_NAME
-  ob_snapshot_create
+  if ! ob_snapshot_create; then
+    ob_err "Snapshot creation failed; nothing will be uploaded."
+    return 1
+  fi
+
+  if [ "$auto" = "true" ]; then
+    if ob_remote_configured; then
+      ob_info "Automatic $status_color snapshot created; uploading it to the configured backup destination."
+      ob_remote_push "$OB_CREATED_SNAPSHOT_NAME" || return 1
+    else
+      ob_warn "No usable remote backup destination is configured; automatic snapshot '$OB_CREATED_SNAPSHOT_NAME' remains local only."
+    fi
+  fi
 }
 
 main() {

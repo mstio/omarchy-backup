@@ -185,5 +185,12 @@ ob_status() {
 }
 
 ob_status_color_only() {
-  ob_status | head -n1 | awk '{print $2}'
+  # Consume the complete status output before selecting its first line.
+  # Piping ob_status directly into `head` closed stdout early and produced
+  # misleading "echo: write error: Broken pipe" messages on YELLOW status.
+  local status_output first_line color
+  status_output="$(ob_status)" || return 1
+  first_line="${status_output%%$'\n'*}"
+  color="${first_line#Status: }"
+  printf '%s\n' "${color%% *}"
 }

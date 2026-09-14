@@ -42,9 +42,21 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local desc="$1" haystack="$2" needle="$3"
+  if ! echo "$haystack" | grep -qF "$needle"; then ok "$desc"; else
+    fail "$desc (unexpectedly found '$needle')"
+  fi
+}
+
 assert_file() {
   local desc="$1" path="$2"
   if [ -e "$path" ]; then ok "$desc"; else fail "$desc (missing: $path)"; fi
+}
+
+assert_not_file() {
+  local desc="$1" path="$2"
+  if [ ! -e "$path" ]; then ok "$desc"; else fail "$desc (unexpected: $path)"; fi
 }
 
 new_home() {
@@ -54,9 +66,9 @@ new_home() {
 }
 
 configure_remote() {
-  local home="$1"
+  local home="$1" namespace="${2:-omarchy-backup}"
   sed -i 's/^OB_CFG_REMOTE_NAME=.*/OB_CFG_REMOTE_NAME=testlocal/' "$home/.config/omarchy-backup/config.conf"
-  sed -i "s|^OB_CFG_REMOTE_PATH=.*|OB_CFG_REMOTE_PATH=$REMOTE_STORAGE/omarchy-backup|" "$home/.config/omarchy-backup/config.conf"
+  sed -i "s|^OB_CFG_REMOTE_PATH=.*|OB_CFG_REMOTE_PATH=$REMOTE_STORAGE/$namespace|" "$home/.config/omarchy-backup/config.conf"
 }
 
 seed_workspace() {
@@ -112,6 +124,7 @@ HOME="$FRESH" configure_remote "$FRESH"
 HOME="$HOME" configure_remote "$HOME"
 push_out="$(omarchy-backup push base 2>&1)"
 assert_contains "push uploaded" "$push_out" "Upload complete"
+assert_contains "push verified remote copy" "$push_out" "Upload copied; verifying"
 restore_out="$(HOME="$FRESH" omarchy-backup restore base 2>&1)"
 assert_contains "restore pulled from remote" "$restore_out" "not found locally; trying remote"
 assert_contains "restore integrity ok" "$restore_out" "Payload integrity OK"
@@ -202,6 +215,83 @@ assert_file "snapshot payload landed under the local destination" \
 doctor_out="$(omarchy-backup doctor 2>&1)"
 assert_contains "doctor sees the local-path destination as configured (not WARN)" \
   "$doctor_out" "Remote backup                OK"
+
+echo "== 12. automatic YELLOW snapshots are pushed; GREEN is skipped =="
+HOME="$(new_home home_auto_push)"
+omarchy-backup init >/dev/null 2>&1
+configure_remote "$HOME" auto-push
+seed_workspace "$HOME"
+omarchy-backup snapshot auto-base --baseline >/dev/null 2>&1
+omarchy-backup push auto-base >/dev/null 2>&1
+green_out="$(omarchy-backup snapshot auto-green --auto 2>&1)"
+assert_contains "automatic GREEN run is skipped" "$green_out" "skipping automatic snapshot"
+assert_not_file "GREEN run created no snapshot" "$HOME/.local/share/omarchy-backup/snapshots/auto-green"
+echo "drift = true" >> "$HOME/.config/hypr/looknfeel.lua"
+yellow_out="$(omarchy-backup snapshot auto-yellow --auto 2>&1)"
+assert_contains "automatic YELLOW run uploads" "$yellow_out" "Automatic YELLOW snapshot created"
+assert_contains "automatic YELLOW upload is verified" "$yellow_out" "Upload complete and verified"
+assert_not_contains "automatic status check has no broken-pipe noise" "$yellow_out" "Broken pipe"
+assert_file "automatic YELLOW snapshot reached remote" \
+  "$REMOTE_STORAGE/auto-push/$(hostname)/auto-yellow/payload.tar.zst"
+assert_eq "automatic YELLOW snapshot marked pushed" "true" \
+  "$(jq -r '.snapshots[] | select(.name=="auto-yellow") | .remote_pushed' "$HOME/.local/share/omarchy-backup/state.json")"
+printf 'corruption' >> "$HOME/.local/share/omarchy-backup/snapshots/auto-base/payload.tar.zst"
+red_out="$(omarchy-backup snapshot auto-red --auto 2>&1)"; red_rc=$?
+assert_eq "automatic RED run fails closed" "1" "$red_rc"
+assert_contains "automatic RED refusal is explained" "$red_out" "refusing to create or upload"
+assert_not_file "automatic RED run creates no snapshot" "$HOME/.local/share/omarchy-backup/snapshots/auto-red"
+
+echo "== 13. remote retention permanently protects the baseline =="
+HOME="$(new_home home_remote_retention)"
+omarchy-backup init >/dev/null 2>&1
+configure_remote "$HOME" remote-retention
+seed_workspace "$HOME"
+omarchy-backup snapshot keep-base --baseline >/dev/null 2>&1
+omarchy-backup push keep-base >/dev/null 2>&1
+for n in rolling-1 rolling-2 rolling-3; do
+  echo "$n" >> "$HOME/.config/hypr/looknfeel.lua"
+  omarchy-backup snapshot "$n" < /dev/null >/dev/null 2>&1
+  omarchy-backup push "$n" >/dev/null 2>&1
+done
+REMOTE_HOST_DIR="$REMOTE_STORAGE/remote-retention/$(hostname)"
+assert_file "baseline survives remote rotation" "$REMOTE_HOST_DIR/keep-base/payload.tar.zst"
+assert_not_file "oldest rolling snapshot is pruned" "$REMOTE_HOST_DIR/rolling-1"
+assert_file "newer rolling snapshot retained" "$REMOTE_HOST_DIR/rolling-2/payload.tar.zst"
+assert_file "newest rolling snapshot retained" "$REMOTE_HOST_DIR/rolling-3/payload.tar.zst"
+assert_eq "remote index contains exactly baseline plus two rolling snapshots" "3" \
+  "$(jq '.snapshots | length' "$REMOTE_HOST_DIR/index.json")"
+assert_eq "remote index still marks protected baseline" "true" \
+  "$(jq -r '.snapshots[] | select(.name=="keep-base") | .baseline' "$REMOTE_HOST_DIR/index.json")"
+
+echo "== 14. corrupt local snapshots and failed remote checks are never indexed =="
+HOME="$(new_home home_push_guards)"
+omarchy-backup init >/dev/null 2>&1
+configure_remote "$HOME" push-guards
+seed_workspace "$HOME"
+omarchy-backup snapshot corrupt >/dev/null 2>&1
+printf 'corruption' >> "$HOME/.local/share/omarchy-backup/snapshots/corrupt/payload.tar.zst"
+corrupt_out="$(omarchy-backup push corrupt 2>&1)"; corrupt_rc=$?
+assert_eq "corrupt local payload makes push fail" "1" "$corrupt_rc"
+assert_contains "corrupt local payload is explained" "$corrupt_out" "failed its payload checksum"
+assert_not_file "corrupt snapshot never reached remote" \
+  "$REMOTE_STORAGE/push-guards/$(hostname)/corrupt"
+
+seed_workspace "$HOME" verify
+omarchy-backup snapshot verify-fail >/dev/null 2>&1
+FAKE_BIN="$WORK/fake-rclone-bin"
+mkdir -p "$FAKE_BIN"
+REAL_RCLONE="$(command -v rclone)"
+cat > "$FAKE_BIN/rclone" <<EOF
+#!/bin/bash
+if [ "\${1:-}" = check ]; then exit 42; fi
+exec "$REAL_RCLONE" "\$@"
+EOF
+chmod +x "$FAKE_BIN/rclone"
+verify_out="$(PATH="$FAKE_BIN:$PATH" omarchy-backup push verify-fail 2>&1)"; verify_rc=$?
+assert_eq "failed rclone check makes push fail" "1" "$verify_rc"
+assert_contains "failed rclone check is explained" "$verify_out" "Remote verification"
+assert_eq "unverified snapshot is not marked pushed" "null" \
+  "$(jq -r '.snapshots[] | select(.name=="verify-fail") | .remote_pushed // "null"' "$HOME/.local/share/omarchy-backup/state.json")"
 
 echo
 echo "== Summary: $PASS passed, $FAIL failed =="

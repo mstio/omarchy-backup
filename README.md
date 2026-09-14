@@ -138,7 +138,11 @@ install` after changing either frequency in config.conf.
   snapshot when `status` is already GREEN (`OB_CFG_SKIP_AUTO_IF_CLEAN`), and
   fires an out-of-cycle `doctor` run first if it notices Omarchy itself was
   updated since the last check (see below) -- so you're not left DEGRADED
-  for a whole month after a big Omarchy update.
+  for a whole month after a big Omarchy update. A YELLOW state creates a
+  rolling snapshot and automatically pushes it when a remote destination is
+  configured. RED/UNKNOWN states are refused: repair or establish the
+  known-good baseline first. A missing remote leaves the snapshot local and
+  emits a warning.
 - An automatic `doctor --auto` run that comes back DEGRADED sends a desktop
   notification (`notify-send`) in addition to the journal log, since a log
   line nobody reads isn't "visible" to you.
@@ -183,7 +187,11 @@ push/pull/retention code. Layout at the destination:
 ```
 
 `push` updates `index.json` and prunes remote snapshots beyond
-`OB_CFG_RETENTION_REMOTE` (oldest first). `restore <name>` pulls
+`OB_CFG_RETENTION_REMOTE`. The known-good baseline is always retained; the
+remaining slots contain the newest rolling snapshots (the default `3` means
+one baseline plus two rolling copies). Every push first validates the local
+payload checksum, then runs `rclone check` after copying. A snapshot is marked
+as pushed and indexed only after that comparison succeeds. `restore <name>` pulls
 automatically from the remote if the snapshot isn't present locally --
 that's the fresh-install path (see below).
 

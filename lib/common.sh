@@ -94,7 +94,9 @@ OB_CFG_REMOTE_NAME=
 # With OB_CFG_REMOTE_NAME empty: an absolute local folder path.
 OB_CFG_REMOTE_PATH=omarchy-backup
 
-# How many snapshot archives to keep on the remote (per hostname).
+# Total snapshot archives to keep on the remote (per hostname). The known-good
+# baseline is always protected; the remaining slots hold the newest rolling
+# snapshots. With the default 3 this means one baseline plus two rolling copies.
 OB_CFG_RETENTION_REMOTE=3
 
 # Files larger than this (inside included config paths) are skipped and

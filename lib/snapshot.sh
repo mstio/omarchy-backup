@@ -68,6 +68,7 @@ ob_snapshot_create() {
 
   local name="${OB_SNAPSHOT_NAME:-snapshot-$(date '+%Y%m%d-%H%M%S')}"
   local mark_baseline="${OB_MARK_BASELINE:-false}"
+  OB_CREATED_SNAPSHOT_NAME="$name"
 
   local state; state="$(ob_state_read)"
   if echo "$state" | jq -e --arg n "$name" '.snapshots[] | select(.name==$n)' >/dev/null; then
