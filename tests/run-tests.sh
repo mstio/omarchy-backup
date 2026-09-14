@@ -293,6 +293,15 @@ assert_contains "failed rclone check is explained" "$verify_out" "Remote verific
 assert_eq "unverified snapshot is not marked pushed" "null" \
   "$(jq -r '.snapshots[] | select(.name=="verify-fail") | .remote_pushed // "null"' "$HOME/.local/share/omarchy-backup/state.json")"
 
+echo "== 15. snapshot creation fails closed on an unwritable data target =="
+HOME="$(new_home home_snapshot_write_failure)"
+seed_workspace "$HOME"
+touch "$HOME/data-is-a-file"
+write_fail_out="$(OMARCHY_BACKUP_DATA_DIR="$HOME/data-is-a-file" omarchy-backup snapshot must-not-exist 2>&1)"; write_fail_rc=$?
+assert_eq "snapshot returns failure when its data directory cannot be created" "1" "$write_fail_rc"
+assert_contains "snapshot failure explains the backup-directory problem" "$write_fail_out" "Could not create or initialize the backup directories"
+assert_not_contains "snapshot failure never reports success" "$write_fail_out" "Snapshot 'must-not-exist' created"
+
 echo
 echo "== Summary: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]

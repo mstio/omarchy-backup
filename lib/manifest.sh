@@ -65,14 +65,16 @@ ob_resolve_consider_file() {
 # ob_write_checksums <out-file> <file...>
 ob_write_checksums() {
   local out="$1"; shift
-  : > "$out"
-  local f rel
+  : > "$out" || return 1
+  local f rel hash
   for f in "$@"; do
     rel="${f#"$HOME"/}"
     if [ -L "$f" ]; then
-      printf '%s  %s\n' "symlink:$(readlink -- "$f")" "$rel" >> "$out"
+      printf '%s  %s\n' "symlink:$(readlink -- "$f")" "$rel" >> "$out" || return 1
     elif [ -f "$f" ]; then
-      printf '%s  %s\n' "$(sha256sum -- "$f" 2>/dev/null | awk '{print $1}')" "$rel" >> "$out"
+      hash="$(sha256sum -- "$f" 2>/dev/null | awk '{print $1}')" || return 1
+      [ -n "$hash" ] || return 1
+      printf '%s  %s\n' "$hash" "$rel" >> "$out" || return 1
     fi
   done
 }

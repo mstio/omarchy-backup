@@ -61,10 +61,10 @@ ob_pick_slot_to_replace() {
 }
 
 ob_snapshot_create() {
-  ob_ensure_dirs
+  ob_ensure_dirs || ob_die "Could not create or initialize the backup directories."
   ob_load_config
   ob_read_path_rules
-  ob_state_init_if_missing
+  ob_state_init_if_missing || ob_die "Could not initialize backup state: $OB_STATE_FILE"
 
   local name="${OB_SNAPSHOT_NAME:-snapshot-$(date '+%Y%m%d-%H%M%S')}"
   local mark_baseline="${OB_MARK_BASELINE:-false}"
@@ -89,8 +89,9 @@ ob_snapshot_create() {
   fi
 
   ob_info "Creating snapshot '$name'..."
-  local snap_dir="$OB_SNAPSHOTS_DIR/$name"
-  mkdir -p "$snap_dir"
+  local final_snap_dir="$OB_SNAPSHOTS_DIR/$name"
+  local snap_dir="$OB_SNAPSHOTS_DIR/.${name}.partial.$$"
+  mkdir -p "$snap_dir" || ob_die "Could not create the snapshot staging directory: $snap_dir"
 
   local OB_SKIPPED_LARGE=() OB_SKIPPED_SECRET=()
   ob_resolve_included_files
@@ -104,25 +105,46 @@ ob_snapshot_create() {
   done > "$filelist"
   local payload="$snap_dir/payload.tar.zst"
   if [ -s "$filelist" ]; then
-    tar -C "$HOME" --null -T "$filelist" -cf - 2>/dev/null | zstd -q -19 -T0 -o "$payload"
+    if ! tar -C "$HOME" --null -T "$filelist" -cf - 2>/dev/null | zstd -q -19 -T0 -o "$payload"; then
+      rm -f -- "$filelist"
+      rm -rf -- "$snap_dir"
+      ob_die "Could not create the snapshot payload. The previous snapshots were left untouched."
+    fi
   else
-    tar -C "$HOME" --files-from=/dev/null -cf - | zstd -q -o "$payload"
+    if ! tar -C "$HOME" --files-from=/dev/null -cf - | zstd -q -o "$payload"; then
+      rm -f -- "$filelist"
+      rm -rf -- "$snap_dir"
+      ob_die "Could not create the empty snapshot payload. The previous snapshots were left untouched."
+    fi
   fi
   rm -f "$filelist"
 
-  ob_write_checksums "$snap_dir/checksums.sha256" "${OB_RESOLVED_FILES[@]}"
+  if ! ob_write_checksums "$snap_dir/checksums.sha256" "${OB_RESOLVED_FILES[@]}"; then
+    rm -rf -- "$snap_dir"
+    ob_die "Could not write snapshot checksums. The previous snapshots were left untouched."
+  fi
 
-  local inventory; inventory="$(ob_inv_all)"
+  local inventory
+  if ! inventory="$(ob_inv_all)" || ! echo "$inventory" | jq -e . >/dev/null; then
+    rm -rf -- "$snap_dir"
+    ob_die "Could not collect a valid system inventory. The previous snapshots were left untouched."
+  fi
   local payload_sha payload_size
-  payload_sha="$(sha256sum -- "$payload" | awk '{print $1}')"
-  payload_size="$(stat -c '%s' -- "$payload")"
+  if ! payload_sha="$(sha256sum -- "$payload" | awk '{print $1}')" || [ -z "$payload_sha" ]; then
+    rm -rf -- "$snap_dir"
+    ob_die "Could not checksum the snapshot payload. The previous snapshots were left untouched."
+  fi
+  if ! payload_size="$(stat -c '%s' -- "$payload")"; then
+    rm -rf -- "$snap_dir"
+    ob_die "Could not measure the snapshot payload. The previous snapshots were left untouched."
+  fi
 
   local skipped_large_json skipped_secret_json
   skipped_large_json="$(printf '%s\n' "${OB_SKIPPED_LARGE[@]:-}" | jq -R 'select(length>0)' | jq -s .)"
   skipped_secret_json="$(printf '%s\n' "${OB_SKIPPED_SECRET[@]:-}" | jq -R 'select(length>0)' | jq -s .)"
 
   local manifest
-  manifest="$(jq -n \
+  if ! manifest="$(jq -n \
     --arg schema_version "1" \
     --arg name "$name" \
     --arg created_at "$(date -Iseconds)" \
@@ -150,12 +172,20 @@ ob_snapshot_create() {
       skipped_secret_files:$skipped_secret,
       payload: {file:$payload_file, sha256:$payload_sha256, size_bytes:$payload_size},
       file_count:$file_count
-    }')"
-  echo "$manifest" | jq . > "$snap_dir/manifest.json"
+    }')" || ! echo "$manifest" | jq . > "$snap_dir/manifest.json"; then
+    rm -rf -- "$snap_dir"
+    ob_die "Could not write a valid snapshot manifest. The previous snapshots were left untouched."
+  fi
 
-  # Remove replaced slot, if any, then update state.json.
+  if ! mv -- "$snap_dir" "$final_snap_dir"; then
+    rm -rf -- "$snap_dir"
+    ob_die "Could not finalize the snapshot. The previous snapshots were left untouched."
+  fi
+  snap_dir="$final_snap_dir"
+
+  # Update state before pruning the replaced slot: if state writing fails, the
+  # old snapshot remains recoverable and the new directory is merely orphaned.
   if [ -n "$victim" ]; then
-    rm -rf -- "${OB_SNAPSHOTS_DIR:?}/$victim"
     state="$(echo "$state" | jq --arg n "$victim" '.snapshots |= map(select(.name!=$n))')"
   fi
   if [ "$mark_baseline" = "true" ]; then
@@ -168,7 +198,12 @@ ob_snapshot_create() {
     --argjson size_bytes "$payload_size" \
     '{name:$name, created_at:$created_at, path:$path, baseline:$baseline, omarchy_version:$omarchy_version, size_bytes:$size_bytes}')"
   state="$(echo "$state" | jq --argjson e "$entry" '.snapshots += [$e]')"
-  ob_state_write "$state"
+  if ! ob_state_write "$state"; then
+    ob_die "Snapshot data was created, but state.json could not be updated; existing snapshots were left untouched."
+  fi
+  if [ -n "$victim" ] && ! rm -rf -- "${OB_SNAPSHOTS_DIR:?}/$victim"; then
+    ob_warn "New snapshot is active, but the replaced snapshot directory could not be removed: $victim"
+  fi
 
   ob_info "Snapshot '$name' created ($((payload_size / 1024 / 1024))MB payload, ${#OB_RESOLVED_FILES[@]} files)."
   if [ "${#OB_SKIPPED_LARGE[@]}" -gt 0 ]; then

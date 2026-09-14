@@ -3,7 +3,7 @@
 # Expects: set -uo pipefail already active in the caller (intentionally no -e;
 # see the comment in bin/omarchy-backup).
 
-OB_VERSION="0.1.0"
+OB_VERSION="0.1.1"
 
 OB_CONFIG_DIR="${OMARCHY_BACKUP_CONFIG_DIR:-$HOME/.config/omarchy-backup}"
 OB_DATA_DIR="${OMARCHY_BACKUP_DATA_DIR:-$HOME/.local/share/omarchy-backup}"
@@ -42,9 +42,9 @@ ob_log_to_file() {
 # --- setup / dirs --------------------------------------------------------
 
 ob_ensure_dirs() {
-  mkdir -p "$OB_CONFIG_DIR" "$OB_PATHS_D_DIR" "$OB_DATA_DIR" "$OB_SNAPSHOTS_DIR" "$OB_LOG_DIR"
-  ob_write_default_config
-  ob_write_default_paths
+  mkdir -p "$OB_CONFIG_DIR" "$OB_PATHS_D_DIR" "$OB_DATA_DIR" "$OB_SNAPSHOTS_DIR" "$OB_LOG_DIR" || return 1
+  ob_write_default_config || return 1
+  ob_write_default_paths || return 1
 }
 
 # --- config loading --------------------------------------------------------

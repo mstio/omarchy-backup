@@ -266,17 +266,46 @@ to itself (the convention already used elsewhere on this machine).
 - Full bit-for-bit fidelity is explicitly a non-goal; the target is "fresh
   Omarchy -> functionally the same personal workspace."
 
-## Decay detection (`doctor`)
+## Protection against backup and tool decay
 
-Omarchy's own directory layout, plugin system, or package tooling can
-change over time and quietly break this tool. `doctor` checks: Omarchy
-version detected, expected directories present, plugin detection working,
-package inventory working, configured paths resolving to something,
-machine memory readable, the agent symlink triplet intact, this tool's own
-systemd units well-formed, the remote reachable, a snapshot still
-creatable, the latest local manifest well-formed, its checksum valid, and
-the commands `restore` depends on (`pacman`, `git`, `systemctl`, `omarchy`)
-still present.
+There are three different failure modes to defend against: a saved snapshot
+can become unusable, Omarchy can evolve until the installed tool no longer
+fits the system, or the local checkout of this tool can disappear. They are
+handled separately.
+
+### Backup-data decay
+
+- The known-good baseline is never selected by automatic local slot rotation
+  or remote retention. The remaining slots are replaceable rolling snapshots.
+- Automatic runs save **YELLOW** drift because it may be the only recoverable
+  version of a still-functioning system. They never silently promote it to the
+  known-good baseline. **RED/UNKNOWN** is refused because it cannot establish a
+  trustworthy recovery point.
+- Every snapshot contains a manifest and SHA-256 file checksums. Before upload,
+  the local payload checksum is validated; after upload, `rclone check` compares
+  the remote files. Only a successful comparison marks a snapshot as pushed and
+  adds it to `index.json`.
+- Restore is dry-runnable and verifies restored files. Existing files are moved
+  aside as `.bak.<timestamp>` before replacement. Secret-shaped and oversized
+  files remain explicitly excluded and are reported as manual steps instead of
+  being silently assumed safe.
+
+These checks detect corruption and incomplete transfer; they do not prove that
+the current desktop state is desirable. GREEN means “matches the selected
+baseline,” and YELLOW means “drift was preserved,” not “the changed state was
+approved.” A restore on a disposable VM or spare machine remains the strongest
+end-to-end test.
+
+### Tool/environment decay (`doctor`)
+
+Omarchy's directory layout, plugin system, or package tooling can change over
+time and quietly break backup or restore. `doctor` checks: Omarchy version
+detected, expected directories present, plugin detection working, package
+inventory working, configured paths resolving to something, machine memory
+readable, the agent symlink triplet intact, this tool's own systemd units
+well-formed, the remote reachable, a snapshot still creatable, the latest local
+manifest well-formed, its checksum valid, and the commands `restore` depends on
+(`pacman`, `git`, `systemctl`, `omarchy`) still present.
 
 ```
 Omarchy version             OK
@@ -305,12 +334,34 @@ mechanism (compare `pacman -Q omarchy`'s version string to the last one
 seen) rather than hooking pacman itself -- a user-level tool has no clean,
 non-fragile way to hook a system-level pacman transaction.
 
+`doctor` is an early-warning compatibility probe, not a formal proof of every
+restore branch. Its snapshot-capability test and latest-checksum validation
+catch common silent regressions; the self-contained test suite and an occasional
+real fresh-install restore cover the deeper path.
+
+### Recovering the tool itself
+
+Snapshots deliberately do not embed this repository checkout. The installed
+`~/.local/bin/omarchy-backup` is a symlink to that checkout, so neither is an
+independent rescue copy. The public GitHub repository is the canonical
+off-machine copy of the program: on a fresh Omarchy installation, clone it and
+run `./install.sh` first, then use `remote-list`, `pull`, or `restore` to recover
+your snapshots. Keep the repository URL with your remote-storage recovery
+notes, because credentials are intentionally not inside the backup.
+
 ## Bar widget (optional)
 
-`~/.config/omarchy/plugins/mst.omarchy-backup/` is a companion Omarchy shell
-bar-widget plugin (independent of this repo -- it just shells out to the
-`omarchy-backup` CLI, plus `rclone`/`jq`/`systemctl` directly for a couple of
-read-only lookups). Enable it with `omarchy plugin enable mst.omarchy-backup`.
+[`mst.omarchy-backup`](https://github.com/mstio/mst.omarchy-backup) is the
+optional companion Omarchy shell bar-widget plugin. It is an independent UI
+repository and requires this CLI on `PATH`; restore never depends on the
+widget. Install it with:
+
+```bash
+omarchy plugin add https://github.com/mstio/mst.omarchy-backup.git --enable
+```
+
+![Omarchy Backup bar widget](assets/plugin-preview.png)
+
 It shows a status dot (colored like `status`'s GREEN/YELLOW/RED) in the bar
 and opens a dialog on click with:
 
@@ -359,7 +410,9 @@ Covers: init, snapshot+baseline, GREEN/YELLOW drift detection, remote
 push + fresh-`$HOME` restore (this is what proves checksums are portable,
 not tied to the exact `$HOME` path a snapshot was taken under), the
 never-silently-overwrite backup-aside behavior, dry-run writing nothing,
-`doctor` running end to end, and 3-slot rotation/replacement.
+`doctor` running end to end, 3-slot rotation/replacement, verified automatic
+YELLOW uploads, baseline retention, corrupt-payload rejection, and failed
+remote-check handling.
 
 To actually validate a fresh-install restore for real (not just the test
 suite's simulation), the most convincing check is a real spare
@@ -389,3 +442,7 @@ tests/run-tests.sh                 self-contained test suite
 State lives in `~/.local/share/omarchy-backup/`: `state.json` (slot
 bookkeeping, baseline pointer, last doctor result) and
 `snapshots/<name>/{manifest.json,checksums.sha256,payload.tar.zst}`.
+
+## License
+
+[MIT](LICENSE)
