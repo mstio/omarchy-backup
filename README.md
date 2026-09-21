@@ -292,6 +292,39 @@ to itself (the convention already used elsewhere on this machine).
 - Full bit-for-bit fidelity is explicitly a non-goal; the target is "fresh
   Omarchy -> functionally the same personal workspace."
 
+### Manual recovery without this tool
+
+Snapshots deliberately use standard, inspectable files rather than a private
+container format. `payload.tar.zst` is a Zstandard-compressed tar archive,
+`manifest.json` is JSON, and `checksums.sha256` is plain text. If this project
+ever disappears or stops running, recover a snapshot with stock tools:
+
+```bash
+snapshot=/path/to/snapshot-name
+staging="$(mktemp -d)"
+
+# Compare this output with: jq -r .payload.sha256 "$snapshot/manifest.json"
+sha256sum "$snapshot/payload.tar.zst"
+
+# Inspect first, then extract into an empty staging directory -- not over $HOME.
+zstd -dc "$snapshot/payload.tar.zst" | tar -tf -
+zstd -dc "$snapshot/payload.tar.zst" | tar -x -C "$staging"
+
+# Verify regular files. Custom `symlink:...` records are inspected separately.
+grep -v '^symlink:' "$snapshot/checksums.sha256" > "$staging-checksums.sha256"
+(cd "$staging" && sha256sum -c "$staging-checksums.sha256")
+grep '^symlink:' "$snapshot/checksums.sha256" || true
+```
+
+Review the extracted tree and copy back only the files you want. Package lists,
+plugin remotes/commits, user-unit states, skipped files, and other reconstruction
+metadata remain readable with `jq` in `manifest.json`. Automated restore is a
+convenience layer over this format, not a prerequisite for accessing the data.
+
+Backward-readable, tool-independent payloads are a format invariant. Future
+authenticity metadata must be a detached sidecar and must not make manual tar
+extraction depend on `omarchy-backup`.
+
 ## Protection against backup and tool decay
 
 There are three different failure modes to defend against: a saved snapshot
@@ -440,8 +473,8 @@ never-silently-overwrite backup-aside behavior, dry-run writing nothing,
 YELLOW uploads, baseline retention, corrupt-payload rejection, and failed
 remote-check handling. Security regressions additionally cover rejected local
 and remote traversal names, fail-closed malicious indexes, deletion-prefix
-containment, remote-read deadlines, and owner-only local backup permissions
-(69 assertions total).
+containment, remote-read deadlines, owner-only local backup permissions, and
+manual extraction with stock `zstd`/`tar` tools (71 assertions total).
 
 To actually validate a fresh-install restore for real (not just the test
 suite's simulation), the most convincing check is a real spare

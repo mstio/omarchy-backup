@@ -29,7 +29,9 @@ always inspect `restore --dry-run` before restoring remote data.
 Planned defense-in-depth work, in priority order:
 
 1. Add signatures or a MAC whose trust key is kept separately from the backup
-   endpoint, and fail closed on unauthenticated remote restores.
+   endpoint, and fail closed on unauthenticated remote restores. Authentication
+   metadata must remain a detached sidecar: the standard `tar.zst` payload must
+   always stay manually readable without this tool.
 2. Strictly validate the complete restore manifest (package/plugin/unit names,
    commit IDs and remote URLs), use argument arrays/option terminators, and
    inspect archive paths/types before writing or enabling anything.

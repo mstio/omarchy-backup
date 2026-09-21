@@ -103,6 +103,17 @@ assert_file "payload exists" "$HOME/.local/share/omarchy-backup/snapshots/base/p
 assert_file "checksums exist" "$HOME/.local/share/omarchy-backup/snapshots/base/checksums.sha256"
 assert_eq "snapshot payload is private" "600" "$(stat -c '%a' "$HOME/.local/share/omarchy-backup/snapshots/base/payload.tar.zst")"
 
+echo "== 2b. manual recovery uses only standard zstd/tar/checksum tools =="
+BASE_DIR="$HOME/.local/share/omarchy-backup/snapshots/base"
+MANUAL_DIR="$WORK/manual-extract"
+mkdir -p "$MANUAL_DIR"
+zstd -q -d -c "$BASE_DIR/payload.tar.zst" | tar -x -C "$MANUAL_DIR"
+assert_eq "manual extraction recovers a known file" "gaps_in = 5" \
+  "$(cat "$MANUAL_DIR/.config/hypr/looknfeel.lua")"
+assert_eq "manifest payload hash is independently verifiable" \
+  "$(jq -r .payload.sha256 "$BASE_DIR/manifest.json")" \
+  "$(sha256sum "$BASE_DIR/payload.tar.zst" | awk '{print $1}')"
+
 echo "== 3. status: GREEN on a clean baseline =="
 status_out="$(omarchy-backup status 2>&1)"
 assert_contains "status GREEN" "$status_out" "Status: GREEN"
