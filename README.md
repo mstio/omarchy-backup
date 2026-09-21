@@ -218,8 +218,10 @@ These checks prevent path traversal, unbounded metadata buffering, and stalled
 remote operations. The current checksum design detects accidental corruption,
 but is not a cryptographic authenticity proof against a storage provider that
 can replace both a snapshot and its manifest. Treat the configured backup
-account as trusted, use its access controls/version history, and review a
-remote restore with `--dry-run` first.
+account according to your own threat model, use its access controls/version
+history, and review a remote restore with `--dry-run` when appropriate. Restore
+remains an explicit user-controlled operation: the tool provides the mechanism
+and evidence, while the user owns the decision to apply a self-created state.
 
 ## Restore (fresh Omarchy install -> your workspace)
 

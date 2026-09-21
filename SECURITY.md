@@ -20,18 +20,21 @@ high-trust operation even though normal snapshot/status commands are not.
 
 ## Trust assumptions and remaining hardening
 
-The remote account is currently a trusted source for snapshot *authenticity*.
-Checksums and `rclone check` detect corruption and incomplete transfer, but a
-party able to replace both payload and manifest can create a self-consistent
-malicious snapshot. Use storage-account access controls/version history and
-always inspect `restore --dry-run` before restoring remote data.
+The user decides whether a self-created snapshot and its storage location are
+trusted enough to restore. Checksums and `rclone check` detect corruption and
+incomplete transfer, but a party able to replace both payload and manifest can
+create a self-consistent malicious snapshot. The tool exposes that boundary and
+provides `restore --dry-run`; it does not take ownership of the user's trust
+decision or forbid an explicitly requested restore.
 
 Planned defense-in-depth work, in priority order:
 
-1. Add signatures or a MAC whose trust key is kept separately from the backup
-   endpoint, and fail closed on unauthenticated remote restores. Authentication
-   metadata must remain a detached sidecar: the standard `tar.zst` payload must
-   always stay manually readable without this tool.
+1. Optionally add detached signatures or a MAC whose trust key is kept
+   separately from the backup endpoint. Verification should give the user
+   stronger evidence and a clear warning, while an explicit user override must
+   remain possible. Authentication metadata must remain a detached sidecar: the
+   standard `tar.zst` payload must always stay manually readable without this
+   tool.
 2. Strictly validate the complete restore manifest (package/plugin/unit names,
    commit IDs and remote URLs), use argument arrays/option terminators, and
    inspect archive paths/types before writing or enabling anything.
