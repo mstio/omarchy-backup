@@ -24,6 +24,7 @@
 
 ob_remote_configured() {
   ob_require_tool rclone || return 1
+  ob_require_tool timeout || return 1
   if [ -n "${OB_CFG_REMOTE_NAME:-}" ]; then
     rclone listremotes 2>/dev/null | grep -qxF "${OB_CFG_REMOTE_NAME}:"
   else
@@ -42,27 +43,109 @@ ob_remote_base() {
   fi
 }
 
+ob_remote_snapshot_target() {
+  local base="$1" name="$2" target
+  ob_snapshot_name_valid "$name" || return 1
+  base="${base%/}"
+  [ -n "$base" ] || return 1
+  target="$base/$name"
+  case "$target" in
+    "$base"/*) printf '%s\n' "$target" ;;
+    *) return 1 ;;
+  esac
+}
+
+ob_remote_index_target() {
+  local base="${1%/}"
+  [ -n "$base" ] || return 1
+  printf '%s/index.json\n' "$base"
+}
+
+ob_remote_index_valid() {
+  local file="$1"
+  jq -e \
+    --argjson max_entries "$OB_REMOTE_INDEX_MAX_ENTRIES" \
+    --argjson max_name "$OB_SNAPSHOT_NAME_MAX" '
+      type == "object"
+      and .schema_version == 1
+      and (.snapshots | type == "array" and length <= $max_entries)
+      and ([.snapshots[].name] | length == (unique | length))
+      and all(.snapshots[];
+        type == "object"
+        and (.name | type == "string" and length <= $max_name
+             and test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))
+        and (.created_at | type == "string" and length <= 64
+             and test("^[0-9T:+.-]+$"))
+        and (.baseline | type == "boolean")
+        and (.omarchy_version | type == "string" and length <= 128
+             and test("^[A-Za-z0-9][A-Za-z0-9._+:-]*$"))
+        and (.size_bytes | type == "number" and . >= 0 and . <= 1099511627776)
+      )
+    ' "$file" >/dev/null 2>&1
+}
+
+# Remote input is hostile until proven otherwise. `--count` bounds bytes at
+# the producer, while coreutils timeout puts a hard wall-clock limit around
+# even a wedged backend. Exit 3 means the index does not exist yet.
+ob_remote_read_index() {
+  local base="$1" target tmp rc size
+  target="$(ob_remote_index_target "$base")" || return 1
+  tmp="$(mktemp)" || return 1
+  timeout --signal=TERM --kill-after=5s "${OB_REMOTE_INDEX_TIMEOUT_SECONDS}s" \
+    rclone cat "$target" --count "$((OB_REMOTE_INDEX_MAX_BYTES + 1))" \
+    > "$tmp" 2>/dev/null
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    rm -f -- "$tmp"
+    if [ "$rc" -eq 3 ]; then
+      return 3
+    fi
+    ob_err "Could not read remote snapshot index within the safety deadline."
+    return 1
+  fi
+  size="$(stat -c '%s' -- "$tmp" 2>/dev/null || echo "$((OB_REMOTE_INDEX_MAX_BYTES + 1))")"
+  if [ "$size" -gt "$OB_REMOTE_INDEX_MAX_BYTES" ]; then
+    rm -f -- "$tmp"
+    ob_err "Remote snapshot index exceeds the ${OB_REMOTE_INDEX_MAX_BYTES}-byte safety limit."
+    return 1
+  fi
+  if ! ob_remote_index_valid "$tmp"; then
+    rm -f -- "$tmp"
+    ob_err "Remote snapshot index has an invalid or unsafe schema."
+    return 1
+  fi
+  cat -- "$tmp"
+  rm -f -- "$tmp"
+}
+
 ob_remote_check() {
   # Cheap connectivity/writability probe for `doctor`.
   ob_remote_configured || return 1
-  rclone lsd "$(ob_remote_base)" >/dev/null 2>&1 || rclone mkdir "$(ob_remote_base)" >/dev/null 2>&1
+  timeout --signal=TERM --kill-after=5s 30s rclone lsd "$(ob_remote_base)" >/dev/null 2>&1 \
+    || timeout --signal=TERM --kill-after=5s 30s rclone mkdir "$(ob_remote_base)" >/dev/null 2>&1
 }
 
 ob_remote_push() {
   local name="$1"
+  ob_require_snapshot_name "$name"
   ob_remote_configured || ob_die "No remote configured (set OB_CFG_REMOTE_NAME in $OB_CONFIG_FILE)."
   local dir="$OB_SNAPSHOTS_DIR/$name"
   ob_snapshot_verify_for_push "$name" || return 1
-  local base; base="$(ob_remote_base)"
+  local base target
+  base="$(ob_remote_base)"
+  target="$(ob_remote_snapshot_target "$base" "$name")" \
+    || ob_die "Refusing unsafe remote snapshot target for '$name'."
 
-  ob_info "Uploading '$name' to $base/$name/ ..."
-  if ! rclone copy "$dir" "$base/$name" \
+  ob_info "Uploading '$name' to $target/ ..."
+  if ! timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS}s" \
+      rclone copy "$dir" "$target" \
       --include manifest.json --include checksums.sha256 --include payload.tar.zst; then
     ob_err "Upload of '$name' failed; it was not added to the remote index."
     return 1
   fi
   ob_info "Upload copied; verifying remote files against the local snapshot ..."
-  if ! rclone check "$dir" "$base/$name" \
+  if ! timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS}s" \
+      rclone check "$dir" "$target" \
       --include manifest.json --include checksums.sha256 --include payload.tar.zst; then
     ob_err "Remote verification of '$name' failed; it was not added to the remote index."
     return 1
@@ -101,10 +184,12 @@ ob_snapshot_verify_for_push() {
 
 ob_remote_refresh_index() {
   local base; base="$(ob_remote_base)"
-  local existing='{"schema_version":1,"snapshots":[]}' remote_raw
-  if remote_raw="$(rclone cat "$base/index.json" 2>/dev/null)" \
-      && echo "$remote_raw" | jq -e '.snapshots | type == "array"' >/dev/null 2>&1; then
+  local existing='{"schema_version":1,"snapshots":[]}' remote_raw read_rc
+  if remote_raw="$(ob_remote_read_index "$base")"; then
     existing="$remote_raw"
+  else
+    read_rc=$?
+    [ "$read_rc" -eq 3 ] || return 1
   fi
   local current index
   current="$(ob_state_read | jq '{schema_version:1, snapshots:[.snapshots[] | select(.remote_pushed==true) | {name,created_at,baseline,omarchy_version,size_bytes}]}')"
@@ -115,9 +200,12 @@ ob_remote_refresh_index() {
         ({}; .[$snapshot.name] = $snapshot)) | [.[]] | sort_by(.created_at))
     }
   ')" || return 1
-  local tmp; tmp="$(mktemp)"
+  local tmp target; tmp="$(mktemp)"
   echo "$index" | jq . > "$tmp"
-  if ! rclone copyto "$tmp" "$base/index.json"; then
+  ob_remote_index_valid "$tmp" || { rm -f -- "$tmp"; ob_err "Refusing to write an unsafe remote snapshot index."; return 1; }
+  target="$(ob_remote_index_target "$base")" || { rm -f -- "$tmp"; return 1; }
+  if ! timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS}s" \
+      rclone copyto "$tmp" "$target"; then
     rm -f "$tmp"
     ob_err "Could not update remote snapshot index."
     return 1
@@ -128,7 +216,8 @@ ob_remote_refresh_index() {
 ob_remote_enforce_retention() {
   local keep="${OB_CFG_RETENTION_REMOTE:-3}"
   local base; base="$(ob_remote_base)"
-  local index; index="$(rclone cat "$base/index.json" 2>/dev/null || echo '{"schema_version":1,"snapshots":[]}')"
+  local index
+  index="$(ob_remote_read_index "$base")" || return 1
   local selection excess retained
   selection="$(echo "$index" | jq --argjson keep "$keep" '
     (.snapshots | map(select(.baseline == true)) | sort_by(.created_at) | reverse) as $baselines
@@ -145,15 +234,24 @@ ob_remote_enforce_retention() {
   local n
   while IFS= read -r n; do
     [ -z "$n" ] && continue
+    local target
+    target="$(ob_remote_snapshot_target "$base" "$n")" || {
+      ob_err "Refusing unsafe remote snapshot name from index: '$n'"
+      return 1
+    }
     ob_info "Removing old remote snapshot beyond retention ($keep): $n"
-    if ! rclone purge "$base/$n" >/dev/null 2>&1; then
+    if ! timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS}s" \
+        rclone purge "$target" >/dev/null 2>&1; then
       ob_err "Could not remove expired remote snapshot '$n'; keeping the unpruned index for recovery."
       return 1
     fi
   done <<< "$excess"
-  local tmp; tmp="$(mktemp)"
+  local tmp index_target; tmp="$(mktemp)"
   echo "$retained" | jq . > "$tmp"
-  if ! rclone copyto "$tmp" "$base/index.json"; then
+  ob_remote_index_valid "$tmp" || { rm -f -- "$tmp"; ob_err "Refusing to write an unsafe retained index."; return 1; }
+  index_target="$(ob_remote_index_target "$base")" || { rm -f -- "$tmp"; return 1; }
+  if ! timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS}s" \
+      rclone copyto "$tmp" "$index_target"; then
     rm -f "$tmp"
     ob_err "Could not write the pruned remote snapshot index."
     return 1
@@ -164,18 +262,27 @@ ob_remote_enforce_retention() {
 ob_remote_list() {
   ob_remote_configured || ob_die "No remote configured."
   local base; base="$(ob_remote_base)"
-  rclone cat "$base/index.json" 2>/dev/null \
+  local index
+  index="$(ob_remote_read_index "$base")" || return 1
+  printf '%s\n' "$index" \
     | jq -r '["NAME","CREATED","BASELINE","OMARCHY","SIZE"], (.snapshots[] | [.name,.created_at,(.baseline|tostring),.omarchy_version,((.size_bytes/1048576)|floor|tostring)+"MB"]) | @tsv' \
     | column -t -s $'\t'
 }
 
 ob_remote_pull() {
   local name="$1" dest="${2:-$OB_SNAPSHOTS_DIR/$name}"
+  ob_require_snapshot_name "$name"
   ob_remote_configured || ob_die "No remote configured."
-  local base; base="$(ob_remote_base)"
+  local base target
+  base="$(ob_remote_base)"
+  target="$(ob_remote_snapshot_target "$base" "$name")" \
+    || ob_die "Refusing unsafe remote snapshot target for '$name'."
   mkdir -p "$dest"
   ob_info "Downloading '$name' from $base/$name/ ..."
-  rclone copy "$base/$name" "$dest"
+  timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS}s" \
+    rclone copy "$target" "$dest" \
+      --include manifest.json --include checksums.sha256 --include payload.tar.zst \
+    || ob_die "Download failed or exceeded its safety deadline: $name"
   [ -f "$dest/manifest.json" ] || ob_die "Download incomplete or snapshot not found on remote: $name"
   ob_info "Downloaded to $dest"
 }

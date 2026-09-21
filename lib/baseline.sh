@@ -3,6 +3,7 @@
 
 ob_baseline_mark() {
   local name="$1"
+  ob_require_snapshot_name "$name"
   local dir="$OB_SNAPSHOTS_DIR/$name"
   [ -f "$dir/manifest.json" ] || ob_die "No such snapshot: $name"
 

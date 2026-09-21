@@ -3,7 +3,7 @@
 # Expects: set -uo pipefail already active in the caller (intentionally no -e;
 # see the comment in bin/omarchy-backup).
 
-OB_VERSION="0.1.1"
+OB_VERSION="0.1.2"
 
 OB_CONFIG_DIR="${OMARCHY_BACKUP_CONFIG_DIR:-$HOME/.config/omarchy-backup}"
 OB_DATA_DIR="${OMARCHY_BACKUP_DATA_DIR:-$HOME/.local/share/omarchy-backup}"
@@ -14,6 +14,11 @@ OB_CONFIG_FILE="$OB_CONFIG_DIR/config.conf"
 OB_PATHS_FILE="$OB_CONFIG_DIR/paths.conf"
 OB_PATHS_D_DIR="$OB_CONFIG_DIR/paths.d"
 OB_MAX_SNAPSHOTS=3
+OB_SNAPSHOT_NAME_MAX=128
+OB_REMOTE_INDEX_MAX_BYTES=$((256 * 1024))
+OB_REMOTE_INDEX_MAX_ENTRIES=256
+OB_REMOTE_INDEX_TIMEOUT_SECONDS=20
+OB_REMOTE_OPERATION_TIMEOUT_SECONDS=900
 
 ob_lib_dir() {
   cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd
@@ -43,8 +48,13 @@ ob_log_to_file() {
 
 ob_ensure_dirs() {
   mkdir -p "$OB_CONFIG_DIR" "$OB_PATHS_D_DIR" "$OB_DATA_DIR" "$OB_SNAPSHOTS_DIR" "$OB_LOG_DIR" || return 1
+  chmod 700 "$OB_CONFIG_DIR" "$OB_PATHS_D_DIR" "$OB_DATA_DIR" "$OB_SNAPSHOTS_DIR" "$OB_LOG_DIR" || return 1
   ob_write_default_config || return 1
   ob_write_default_paths || return 1
+  chmod 600 "$OB_CONFIG_FILE" "$OB_PATHS_FILE" || return 1
+  [ ! -f "$OB_STATE_FILE" ] || chmod 600 "$OB_STATE_FILE" || return 1
+  find "$OB_SNAPSHOTS_DIR" "$OB_LOG_DIR" -type d -exec chmod 700 {} + 2>/dev/null || return 1
+  find "$OB_SNAPSHOTS_DIR" "$OB_LOG_DIR" -type f -exec chmod 600 {} + 2>/dev/null || return 1
 }
 
 # --- config loading --------------------------------------------------------
@@ -186,6 +196,22 @@ ob_matches_any_glob() {
 
 ob_require_tool() {
   command -v "$1" >/dev/null 2>&1
+}
+
+# Snapshot names become directory components locally and on an rclone backend.
+# Use one deliberately narrow grammar at every trust boundary: no separators,
+# traversal components, whitespace/control bytes, leading option markers, or
+# rclone remote-spec characters such as ':'.
+ob_snapshot_name_valid() {
+  local name="${1:-}"
+  [ "${#name}" -le "$OB_SNAPSHOT_NAME_MAX" ] || return 1
+  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+}
+
+ob_require_snapshot_name() {
+  local name="${1:-}"
+  ob_snapshot_name_valid "$name" \
+    || ob_die "Invalid snapshot name '$name' (use 1-$OB_SNAPSHOT_NAME_MAX ASCII letters, digits, '.', '_' or '-', starting with a letter or digit)."
 }
 
 ob_hostname() { hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo "unknown-host"; }

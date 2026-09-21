@@ -91,6 +91,8 @@ export HOME
 omarchy-backup init >/dev/null 2>&1
 assert_file "config.conf created" "$HOME/.config/omarchy-backup/config.conf"
 assert_file "paths.conf created" "$HOME/.config/omarchy-backup/paths.conf"
+assert_eq "backup config directory is private" "700" "$(stat -c '%a' "$HOME/.config/omarchy-backup")"
+assert_eq "backup config file is private" "600" "$(stat -c '%a' "$HOME/.config/omarchy-backup/config.conf")"
 
 echo "== 2. snapshot + baseline =="
 seed_workspace "$HOME"
@@ -99,6 +101,7 @@ assert_contains "snapshot created" "$out" "Snapshot 'base' created"
 assert_file "snapshot dir exists" "$HOME/.local/share/omarchy-backup/snapshots/base/manifest.json"
 assert_file "payload exists" "$HOME/.local/share/omarchy-backup/snapshots/base/payload.tar.zst"
 assert_file "checksums exist" "$HOME/.local/share/omarchy-backup/snapshots/base/checksums.sha256"
+assert_eq "snapshot payload is private" "600" "$(stat -c '%a' "$HOME/.local/share/omarchy-backup/snapshots/base/payload.tar.zst")"
 
 echo "== 3. status: GREEN on a clean baseline =="
 status_out="$(omarchy-backup status 2>&1)"
@@ -301,6 +304,54 @@ write_fail_out="$(OMARCHY_BACKUP_DATA_DIR="$HOME/data-is-a-file" omarchy-backup 
 assert_eq "snapshot returns failure when its data directory cannot be created" "1" "$write_fail_rc"
 assert_contains "snapshot failure explains the backup-directory problem" "$write_fail_out" "Could not create or initialize the backup directories"
 assert_not_contains "snapshot failure never reports success" "$write_fail_out" "Snapshot 'must-not-exist' created"
+
+echo "== 16. snapshot names and remote indexes are treated as hostile input =="
+HOME="$(new_home home_remote_input_guards)"
+omarchy-backup init >/dev/null 2>&1
+configure_remote "$HOME" remote-input-guards
+seed_workspace "$HOME"
+
+bad_name_out="$(omarchy-backup snapshot '../escape' 2>&1)"; bad_name_rc=$?
+assert_eq "path-like local snapshot name is rejected" "1" "$bad_name_rc"
+assert_contains "snapshot-name rejection explains the grammar" "$bad_name_out" "Invalid snapshot name"
+assert_not_file "rejected name cannot escape the snapshot directory" \
+  "$HOME/.local/share/omarchy-backup/escape"
+
+omarchy-backup snapshot safe-base --baseline >/dev/null 2>&1
+omarchy-backup push safe-base >/dev/null 2>&1
+echo drift >> "$HOME/.config/hypr/looknfeel.lua"
+omarchy-backup snapshot safe-next >/dev/null 2>&1
+REMOTE_HOST_DIR="$REMOTE_STORAGE/remote-input-guards/$(hostname)"
+mkdir -p "$REMOTE_STORAGE/remote-input-guards/outside"
+echo keep > "$REMOTE_STORAGE/remote-input-guards/outside/sentinel"
+jq -n '{schema_version:1,snapshots:[
+  {name:"../outside",created_at:"2026-09-21T00:00:00+02:00",baseline:false,omarchy_version:"test",size_bytes:1}
+]}' > "$REMOTE_HOST_DIR/index.json"
+malicious_out="$(omarchy-backup push safe-next 2>&1)"; malicious_rc=$?
+assert_eq "push fails closed on a path-like remote index name" "1" "$malicious_rc"
+assert_contains "unsafe remote index is explained" "$malicious_out" "invalid or unsafe schema"
+assert_file "remote index cannot make retention purge outside its prefix" \
+  "$REMOTE_STORAGE/remote-input-guards/outside/sentinel"
+
+HANG_BIN="$WORK/hanging-rclone-bin"
+mkdir -p "$HANG_BIN"
+REAL_TIMEOUT="$(command -v timeout)"
+cat > "$HANG_BIN/timeout" <<EOF
+#!/bin/bash
+for arg in "\$@"; do
+  if [ "\$arg" = cat ]; then exit 124; fi
+done
+exec "$REAL_TIMEOUT" "\$@"
+EOF
+chmod +x "$HANG_BIN/timeout"
+SECONDS=0
+hang_out="$(PATH="$HANG_BIN:$PATH" omarchy-backup remote-list 2>&1)"; hang_rc=$?
+hang_elapsed=$SECONDS
+assert_eq "stalled remote index read fails" "1" "$hang_rc"
+assert_contains "stalled read reports the deadline" "$hang_out" "safety deadline"
+if [ "$hang_elapsed" -lt 5 ]; then ok "stalled remote index is terminated promptly"; else
+  fail "stalled remote index took ${hang_elapsed}s despite the hard deadline"
+fi
 
 echo
 echo "== Summary: $PASS passed, $FAIL failed =="

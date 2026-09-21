@@ -31,6 +31,7 @@ ob_state_baseline_name() {
 ob_pick_slot_to_replace() {
   local state="$1"
   if [ -n "${OB_REPLACE_NAME:-}" ]; then
+    ob_require_snapshot_name "$OB_REPLACE_NAME"
     echo "$OB_REPLACE_NAME"
     return 0
   fi
@@ -68,6 +69,7 @@ ob_snapshot_create() {
 
   local name="${OB_SNAPSHOT_NAME:-snapshot-$(date '+%Y%m%d-%H%M%S')}"
   local mark_baseline="${OB_MARK_BASELINE:-false}"
+  ob_require_snapshot_name "$name"
   OB_CREATED_SNAPSHOT_NAME="$name"
 
   local state; state="$(ob_state_read)"
@@ -82,6 +84,7 @@ ob_snapshot_create() {
     if [ -z "$victim" ]; then
       ob_die "Aborted: no slot chosen to replace."
     fi
+    ob_require_snapshot_name "$victim"
     if ! echo "$state" | jq -e --arg n "$victim" '.snapshots[] | select(.name==$n)' >/dev/null; then
       ob_die "No such snapshot to replace: $victim"
     fi
@@ -229,6 +232,7 @@ ob_snapshot_list() {
 
 ob_snapshot_show() {
   local name="$1"
+  ob_require_snapshot_name "$name"
   local dir="$OB_SNAPSHOTS_DIR/$name"
   [ -f "$dir/manifest.json" ] || ob_die "No such snapshot: $name"
   jq . "$dir/manifest.json"

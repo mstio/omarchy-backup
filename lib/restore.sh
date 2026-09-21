@@ -43,6 +43,7 @@ ob_restore_backup_existing() {
 
 ob_restore_run() {
   local name="$1"
+  ob_require_snapshot_name "$name"
   ob_ensure_dirs
   ob_load_config
   ob_read_path_rules

@@ -4,6 +4,9 @@ Freeze a working Omarchy setup, notice when it drifts, and rebuild it on a
 fresh install. Bash + `jq`/`zstd`/`rclone`/`tar` (all already on a stock
 Omarchy box) -- no new runtime dependencies.
 
+Security boundaries and remaining trust assumptions are documented in
+[`SECURITY.md`](SECURITY.md).
+
 ## Concepts
 
 - **Snapshot**: a named, timestamped capture of the reproducible parts of
@@ -121,6 +124,10 @@ Only 3 snapshots are kept. Creating a 4th:
   auto-replaces the **oldest non-baseline** snapshot and logs the decision;
 - `--replace NAME` picks explicitly either way.
 
+Snapshot names are a single path component: 1–128 ASCII letters, digits,
+periods, underscores, or hyphens, starting with a letter or digit. The same
+grammar is enforced for CLI arguments, local state, and remote index entries.
+
 ## Automatic backups
 
 ```bash
@@ -194,6 +201,25 @@ payload checksum, then runs `rclone check` after copying. A snapshot is marked
 as pushed and indexed only after that comparison succeeds. `restore <name>` pulls
 automatically from the remote if the snapshot isn't present locally --
 that's the fresh-install path (see below).
+
+Remote metadata is treated as untrusted input. Index reads have a 256 KiB
+producer-side limit and a 20-second hard deadline; indexes are rejected unless
+they contain at most 256 schema-valid entries with bounded strings and safe
+snapshot names. Retention constructs every deletion beneath the configured
+host backup prefix only after that validation. Other remote operations have a
+15-minute hard deadline, and pulls request only the three expected snapshot
+files.
+
+Local backup configuration, state, logs, snapshot directories, and snapshot
+files are kept owner-only (`0700` directories / `0600` files). Existing data is
+normalized to those permissions when the CLI initializes its directories.
+
+These checks prevent path traversal, unbounded metadata buffering, and stalled
+remote operations. The current checksum design detects accidental corruption,
+but is not a cryptographic authenticity proof against a storage provider that
+can replace both a snapshot and its manifest. Treat the configured backup
+account as trusted, use its access controls/version history, and review a
+remote restore with `--dry-run` first.
 
 ## Restore (fresh Omarchy install -> your workspace)
 
@@ -412,7 +438,10 @@ not tied to the exact `$HOME` path a snapshot was taken under), the
 never-silently-overwrite backup-aside behavior, dry-run writing nothing,
 `doctor` running end to end, 3-slot rotation/replacement, verified automatic
 YELLOW uploads, baseline retention, corrupt-payload rejection, and failed
-remote-check handling.
+remote-check handling. Security regressions additionally cover rejected local
+and remote traversal names, fail-closed malicious indexes, deletion-prefix
+containment, remote-read deadlines, and owner-only local backup permissions
+(69 assertions total).
 
 To actually validate a fresh-install restore for real (not just the test
 suite's simulation), the most convincing check is a real spare

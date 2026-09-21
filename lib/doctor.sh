@@ -115,13 +115,13 @@ ob_doctor_run() {
 
   # Can we still create a snapshot? (tools + writable data dir; no actual snapshot taken)
   local tool_missing=""
-  for t in jq zstd tar sha256sum rclone; do
+  for t in jq zstd tar sha256sum rclone timeout; do
     ob_require_tool "$t" || tool_missing="$tool_missing $t"
   done
   if [ -w "$OB_DATA_DIR" ] && [ -z "$tool_missing" ]; then
     ob_doctor_check "Snapshot capability" "OK"
   else
-    ob_doctor_check "Snapshot capability" "FAIL" "missing tools:${tool_missing:-none}; data dir writable: $([ -w "$OB_DATA_DIR" ] && echo yes || echo no) -- Fix: install missing tools (\`pacman -S jq zstd tar rclone\`) and/or fix ownership/permissions on $OB_DATA_DIR."
+    ob_doctor_check "Snapshot capability" "FAIL" "missing tools:${tool_missing:-none}; data dir writable: $([ -w "$OB_DATA_DIR" ] && echo yes || echo no) -- Fix: install missing tools (\`pacman -S jq zstd tar rclone coreutils\`) and/or fix ownership/permissions on $OB_DATA_DIR."
   fi
 
   # Manifest schema + checksum validity of the most recent local snapshot

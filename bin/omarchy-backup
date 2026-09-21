@@ -2,6 +2,7 @@
 # omarchy-backup: snapshot / baseline / drift / backup / restore / doctor
 # for a personal Omarchy workspace. See README.md.
 set -uo pipefail
+umask 077
 # Deliberately no `set -e`: this tool relies throughout on
 # `[ cond ] && action` / `A || B` idioms and while-loops whose last command
 # can legitimately be "false" (e.g. no match found) without that meaning the
