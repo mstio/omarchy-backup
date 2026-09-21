@@ -364,6 +364,111 @@ if [ "$hang_elapsed" -lt 5 ]; then ok "stalled remote index is terminated prompt
   fail "stalled remote index took ${hang_elapsed}s despite the hard deadline"
 fi
 
+echo "== 17. git-managed plugins are restored at their pinned commit, never at upstream HEAD =="
+# Fixture: an "upstream" plugin repo, a source HOME with it installed, and a
+# stub `omarchy` CLI that behaves like the real one for add/enable/list.
+UPSTREAM="$WORK/plugin-upstream"
+git init -q -b main "$UPSTREAM"
+cat > "$UPSTREAM/manifest.json" <<'JSON'
+{"schemaVersion":1,"id":"mst.pinned","name":"Pinned","version":"1.0.0","kinds":["bar-widget"],"entryPoints":{"barWidget":"Widget.qml"}}
+JSON
+echo 'Item {}' > "$UPSTREAM/Widget.qml"
+git -C "$UPSTREAM" -c user.name=t -c user.email=t@t add -A
+git -C "$UPSTREAM" -c user.name=t -c user.email=t@t commit -q -m "v1"
+PINNED="$(git -C "$UPSTREAM" rev-parse HEAD)"
+
+STUB_BIN="$WORK/stub-bin"
+mkdir -p "$STUB_BIN"
+cat > "$STUB_BIN/omarchy" <<'STUB'
+#!/bin/bash
+# Minimal stand-in for the parts of `omarchy plugin ...` the restore uses.
+set -uo pipefail
+PLUGINS_DIR="$HOME/.config/omarchy/plugins"
+case "${1:-} ${2:-}" in
+  "plugin list")
+    if [ -n "${OMARCHY_STUB_LIST:-}" ] && [ -f "$OMARCHY_STUB_LIST" ]; then cat "$OMARCHY_STUB_LIST"; else echo '[]'; fi ;;
+  "plugin add")
+    url="$3"; stage="$PLUGINS_DIR/.add.tmp.$$"
+    git clone -q -- "$url" "$stage" 2>/dev/null || exit 1
+    id="$(jq -r .id "$stage/manifest.json")"
+    [ -e "$PLUGINS_DIR/$id" ] && { rm -rf "$stage"; exit 1; }
+    mv "$stage" "$PLUGINS_DIR/$id"; echo "Added $id" ;;
+  "plugin enable")
+    echo "$3" >> "$PLUGINS_DIR/.enabled.log" ;;
+  *) exit 1 ;;
+esac
+STUB
+chmod +x "$STUB_BIN/omarchy"
+
+SRC="$(new_home plugin_src_home)"
+mkdir -p "$SRC/.config/omarchy/plugins"
+git clone -q -- "$UPSTREAM" "$SRC/.config/omarchy/plugins/mst.pinned"
+LIST_JSON="$WORK/stub-list.json"
+echo '[{"id":"mst.pinned","enabled":true}]' > "$LIST_JSON"
+HOME="$SRC" omarchy-backup init >/dev/null 2>&1
+HOME="$SRC" OMARCHY_STUB_LIST="$LIST_JSON" PATH="$STUB_BIN:$PATH" omarchy-backup snapshot pinned >/dev/null 2>&1
+SNAP_SRC="$SRC/.local/share/omarchy-backup/snapshots/pinned"
+assert_eq "snapshot records the plugin's full commit" "$PINNED" \
+  "$(jq -r '.plugins.git_managed[] | select(.id=="mst.pinned") | .commit' "$SNAP_SRC/manifest.json")"
+assert_eq "snapshot records the plugin as enabled" "mst.pinned" \
+  "$(jq -r '.plugins.enabled[0]' "$SNAP_SRC/manifest.json")"
+
+# Upstream moves on after the snapshot: HEAD is now something the user never ran.
+echo 'Item { property bool changed: true }' > "$UPSTREAM/Widget.qml"
+git -C "$UPSTREAM" -c user.name=t -c user.email=t@t commit -q -am "v2 (never run by the user)"
+UPSTREAM_HEAD="$(git -C "$UPSTREAM" rev-parse HEAD)"
+
+restore_into() {
+  # restore_into <home-name> <manifest-mutation-jq>  -> prints restore output
+  local h; h="$(new_home "$1")"
+  local snap="$h/.local/share/omarchy-backup/snapshots/pinned"
+  HOME="$h" omarchy-backup init >/dev/null 2>&1
+  mkdir -p "$snap"
+  cp "$SNAP_SRC/payload.tar.zst" "$SNAP_SRC/checksums.sha256" "$snap/"
+  jq "$2" "$SNAP_SRC/manifest.json" > "$snap/manifest.json"
+  HOME="$h" PATH="$STUB_BIN:$PATH" omarchy-backup restore pinned 2>&1
+}
+
+RESTORE_HOME="$WORK/plugin_fresh_ok"
+out="$(restore_into plugin_fresh_ok '.')"
+P="$RESTORE_HOME/.config/omarchy/plugins/mst.pinned"
+assert_file "pinned plugin was installed" "$P/.git"
+assert_eq "installed plugin is at the pinned commit, not upstream HEAD" "$PINNED" "$(git -C "$P" rev-parse HEAD 2>/dev/null)"
+if [ "$PINNED" != "$UPSTREAM_HEAD" ]; then ok "fixture: upstream HEAD differs from the pin"; else fail "fixture: upstream did not move"; fi
+assert_eq "installed plugin's origin points at the real upstream" "$UPSTREAM" "$(git -C "$P" remote get-url origin 2>/dev/null)"
+assert_contains "pinned plugin was enabled" "$(cat "$RESTORE_HOME/.config/omarchy/plugins/.enabled.log" 2>/dev/null)" "mst.pinned"
+assert_not_file "staging clone was cleaned up" "$RESTORE_HOME/.config/omarchy/plugins/.restore.tmp.mst.pinned.$$"
+
+RESTORE_HOME="$WORK/plugin_fresh_missing"
+out="$(restore_into plugin_fresh_missing '(.plugins.git_managed[] | select(.id=="mst.pinned") | .commit) |= "0000000000000000000000000000000000000000"')"
+assert_not_file "plugin with unavailable pinned commit is not installed" "$RESTORE_HOME/.config/omarchy/plugins/mst.pinned"
+assert_not_contains "plugin with unavailable pinned commit is not enabled" "$(cat "$RESTORE_HOME/.config/omarchy/plugins/.enabled.log" 2>/dev/null)" "mst.pinned"
+assert_contains "missing pin is reported as a manual step" "$out" "pinned commit 0000000000000000000000000000000000000000 not found"
+assert_contains "restore itself still completes" "$out" "Restore of 'pinned' complete"
+
+RESTORE_HOME="$WORK/plugin_fresh_badremote"
+out="$(restore_into plugin_fresh_badremote '(.plugins.git_managed[] | select(.id=="mst.pinned") | .remote) |= "ext::sh -c touch%20/tmp/pwned"')"
+assert_not_file "plugin with helper-style remote is not cloned" "$RESTORE_HOME/.config/omarchy/plugins/mst.pinned"
+assert_contains "helper-style remote is refused" "$out" "not a plain git URL"
+
+RESTORE_HOME="$WORK/plugin_fresh_shortsha"
+out="$(restore_into plugin_fresh_shortsha '(.plugins.git_managed[] | select(.id=="mst.pinned") | .commit) |= "abc123"')"
+assert_not_file "plugin with a short/partial pin is not installed" "$RESTORE_HOME/.config/omarchy/plugins/mst.pinned"
+assert_contains "short pin is refused" "$out" "no full 40-character commit pin"
+
+RESTORE_HOME="$WORK/plugin_fresh_badid"
+out="$(restore_into plugin_fresh_badid '(.plugins.git_managed[] | select(.id=="mst.pinned") | .id) |= "../escape"')"
+assert_not_file "plugin with a path-like id never creates a directory" "$RESTORE_HOME/.config/omarchy/escape"
+assert_contains "path-like plugin id is refused" "$out" "invalid id"
+
+DRY_HOME="$(new_home plugin_fresh_dry)"
+HOME="$DRY_HOME" omarchy-backup init >/dev/null 2>&1
+mkdir -p "$DRY_HOME/.local/share/omarchy-backup/snapshots"
+cp -r "$SNAP_SRC" "$DRY_HOME/.local/share/omarchy-backup/snapshots/pinned"
+out="$(HOME="$DRY_HOME" PATH="$STUB_BIN:$PATH" omarchy-backup restore pinned --dry-run 2>&1)"
+assert_contains "dry run shows the pin it would enforce" "$out" "pinned at $PINNED"
+assert_not_file "dry run clones nothing" "$DRY_HOME/.config/omarchy/plugins/mst.pinned"
+
 echo
 echo "== Summary: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]

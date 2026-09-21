@@ -35,9 +35,15 @@ Planned defense-in-depth work, in priority order:
    remain possible. Authentication metadata must remain a detached sidecar: the
    standard `tar.zst` payload must always stay manually readable without this
    tool.
-2. Strictly validate the complete restore manifest (package/plugin/unit names,
-   commit IDs and remote URLs), use argument arrays/option terminators, and
-   inspect archive paths/types before writing or enabling anything.
+2. Extend restore-manifest plausibility checks beyond plugins. Plugin ids,
+   remotes and commits are already validated and the pinned commit is checked
+   out detached in a staging clone before `omarchy plugin add` or any enable
+   step runs; a plugin whose pin cannot be satisfied is neither installed nor
+   enabled. Package and unit names still go to `pacman`/`systemctl` with only
+   basic quoting; add argument arrays/option terminators and inspect archive
+   paths/types before writing. This is robustness against a damaged or
+   hand-edited manifest, not a substitute for the user trusting their own
+   snapshot.
 3. Cap downloaded snapshot bytes, decompressed bytes, archive members, and
    plugin-diff sizes to resist disk/memory/decompression denial of service.
 4. Replace shell `source` loading of `config.conf` with a non-executing parser.

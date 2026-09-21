@@ -173,51 +173,181 @@ ob_restore_packages() {
   fi
 }
 
+# Plugin pins recorded at snapshot time are enforced at restore time, not
+# merely attempted. A third-party plugin's upstream can move, be force-pushed
+# or be taken over between snapshot and restore, so a snapshot's own
+# `{remote, commit}` is the only thing that says which code the user actually
+# ran. The pinned commit is therefore fetched into a staging clone and checked
+# out detached *before* `omarchy plugin add` copies it into the trusted plugin
+# directory, and a plugin whose pinned commit cannot be found is neither
+# installed nor enabled -- it becomes a manual step instead of silently
+# falling back to whatever the remote's default branch points at today.
+# This is not a judgement about the snapshot's trustworthiness (that remains
+# the user's call); it is the tool keeping the promise its manifest makes.
+
+ob_restore_plugin_id_valid() {
+  # Same grammar `omarchy plugin validate` enforces for manifest ids.
+  local id="${1:-}"
+  [ "${#id}" -le 128 ] || return 1
+  [[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
+  [[ "$id" != *".."* ]]
+}
+
+ob_restore_plugin_commit_valid() {
+  [[ "${1:-}" =~ ^[0-9a-f]{40}$ ]]
+}
+
+ob_restore_plugin_remote_valid() {
+  # Mirrors omarchy-git-url-check: refuse anything git would read as an
+  # option or as a remote-helper invocation (`ext::` runs a shell command),
+  # allow only the transports git connects to itself, plus scp-style and
+  # plain paths, which cannot reach a helper.
+  local url="${1:-}" scheme t
+  [ -n "$url" ] || return 1
+  [ "${#url}" -le 2048 ] || return 1
+  [[ "$url" != *$'\n'* && "$url" != *$'\r'* ]] || return 1
+  [[ "$url" != -* ]] || return 1
+  [[ ! "$url" =~ ^[A-Za-z0-9][A-Za-z0-9+.-]*:: ]] || return 1
+  if [[ "$url" =~ ^([A-Za-z0-9][A-Za-z0-9+.-]*):// ]]; then
+    scheme="${BASH_REMATCH[1]}"
+    for t in ssh git git+ssh ssh+git http https ftp ftps file; do
+      [ "$scheme" = "$t" ] && return 0
+    done
+    return 1
+  fi
+  return 0
+}
+
 ob_restore_plugins() {
   local manifest="$1"
   local plugins_dir="$HOME/.config/omarchy/plugins"
   mkdir -p "$plugins_dir"
 
+  # Plugins that must NOT be enabled afterwards because their pinned code
+  # could not be installed.
+  local -a skip_enable=()
+
   local id remote commit dirty diff
   while IFS= read -r id; do
     [ -z "$id" ] && continue
-    remote="$(echo "$manifest" | jq -r --arg id "$id" '.plugins.git_managed[] | select(.id==$id) | .remote')"
-    commit="$(echo "$manifest" | jq -r --arg id "$id" '.plugins.git_managed[] | select(.id==$id) | .commit')"
-    dirty="$(echo "$manifest" | jq -r --arg id "$id" '.plugins.git_managed[] | select(.id==$id) | .dirty')"
-    diff="$(echo "$manifest" | jq -r --arg id "$id" '.plugins.git_managed[] | select(.id==$id) | .diff')"
+    if ! ob_restore_plugin_id_valid "$id"; then
+      ob_restore_note "Snapshot lists a plugin with an invalid id ($(printf '%q' "$id")); ignored -- review the manifest manually."
+      continue
+    fi
+    remote="$(echo "$manifest" | jq -r --arg id "$id" '[.plugins.git_managed[]? | select(.id==$id) | .remote // ""][0] // ""')"
+    commit="$(echo "$manifest" | jq -r --arg id "$id" '[.plugins.git_managed[]? | select(.id==$id) | .commit // ""][0] // ""')"
+    dirty="$(echo "$manifest" | jq -r --arg id "$id" '[.plugins.git_managed[]? | select(.id==$id) | .dirty // false][0] // false')"
+    diff="$(echo "$manifest" | jq -r --arg id "$id" '[.plugins.git_managed[]? | select(.id==$id) | .diff // ""][0] // ""')"
 
     if [ -z "$remote" ]; then
-      ob_restore_note "Plugin '$id' had no recorded git remote; install/clone it manually."
+      # local_managed plugins arrive with the payload; git_managed ones
+      # without a remote can only be reinstalled by hand.
+      if echo "$manifest" | jq -e --arg id "$id" '.plugins.git_managed[]? | select(.id==$id)' >/dev/null 2>&1; then
+        ob_restore_note "Plugin '$id' had no recorded git remote; install/clone it manually."
+      fi
       continue
     fi
     if [ -d "$plugins_dir/$id/.git" ]; then
       echo "  Plugin '$id' already present, leaving as-is."
-    elif ob_require_tool omarchy; then
-      ob_restore_run_step "install plugin '$id' from $remote" \
-        omarchy plugin add "$remote" --yes
-      if [ "$OB_DRY_RUN" != "true" ] && [ -d "$plugins_dir/$id/.git" ] && [ -n "$commit" ]; then
-        git -C "$plugins_dir/$id" checkout --quiet "$commit" 2>/dev/null \
-          || ob_restore_note "Plugin '$id': could not check out recorded commit $commit (upstream may have rewritten history)."
-        if [ "$dirty" = "true" ] && [ -n "$diff" ]; then
-          if echo "$diff" | git -C "$plugins_dir/$id" apply --check - 2>/dev/null; then
-            echo "$diff" | git -C "$plugins_dir/$id" apply -
-            echo "  Reapplied local uncommitted changes to '$id'."
-          else
-            ob_restore_note "Plugin '$id' had local uncommitted changes that no longer apply cleanly; diff saved to $OB_DATA_DIR/restore-$id.diff for manual review."
-            echo "$diff" > "$OB_DATA_DIR/restore-$id.diff"
-          fi
-        fi
-      fi
-    else
-      ob_restore_note "omarchy CLI not found; clone plugin '$id' manually from $remote"
+      continue
     fi
-  done < <(echo "$manifest" | jq -r '.plugins.git_managed[].id, .plugins.local_managed[]' | sort -u)
+    if ! ob_restore_plugin_remote_valid "$remote"; then
+      ob_restore_note "Plugin '$id': recorded remote is not a plain git URL ($(printf '%q' "$remote")); not installed or enabled -- review and install manually."
+      skip_enable+=("$id")
+      continue
+    fi
+    if ! ob_restore_plugin_commit_valid "$commit"; then
+      ob_restore_note "Plugin '$id': snapshot has no full 40-character commit pin ($(printf '%q' "$commit")); not installed or enabled -- clone $remote and pick a revision manually."
+      skip_enable+=("$id")
+      continue
+    fi
+    if ! ob_require_tool omarchy; then
+      ob_restore_note "omarchy CLI not found; clone plugin '$id' manually from $remote at commit $commit"
+      continue
+    fi
+    if [ "$OB_DRY_RUN" = "true" ]; then
+      echo "  [dry-run] install plugin '$id' from $remote pinned at $commit"
+      echo "            \$ git clone -- $remote <staging> && git -C <staging> checkout --detach $commit"
+      echo "            \$ omarchy plugin add <staging> --yes"
+      continue
+    fi
 
-  local enable_ids disable_ids
-  enable_ids="$(echo "$manifest" | jq -r '.plugins.enabled[]' 2>/dev/null)"
+    echo "  -> install plugin '$id' from $remote pinned at ${commit:0:12}"
+    local stage; stage="$plugins_dir/.restore.tmp.$id.$$"
+    rm -rf -- "$stage"
+    if ! GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -oBatchMode=yes}" \
+        timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS:-900}s" \
+        git clone --quiet -- "$remote" "$stage" >/dev/null 2>&1; then
+      rm -rf -- "$stage"
+      ob_warn "Step failed: clone plugin '$id' from $remote"
+      ob_restore_note "Plugin '$id': could not clone $remote (credentials? private repo? network?); not installed or enabled -- install manually."
+      skip_enable+=("$id")
+      continue
+    fi
+    if ! git -C "$stage" cat-file -e "${commit}^{commit}" 2>/dev/null \
+        || ! git -C "$stage" -c advice.detachedHead=false checkout --quiet --detach "$commit" 2>/dev/null; then
+      rm -rf -- "$stage"
+      ob_warn "Step failed: pinned commit $commit for plugin '$id' is not available at $remote"
+      ob_restore_note "Plugin '$id': pinned commit $commit not found at $remote (history rewritten or remote changed); NOT installed or enabled -- review upstream and install manually."
+      skip_enable+=("$id")
+      continue
+    fi
+    local stage_id; stage_id="$(jq -r '.id // ""' "$stage/manifest.json" 2>/dev/null)"
+    if [ "$stage_id" != "$id" ]; then
+      rm -rf -- "$stage"
+      ob_restore_note "Plugin '$id': repository at $remote (commit $commit) declares plugin id '$stage_id' instead; not installed or enabled -- review manually."
+      skip_enable+=("$id")
+      continue
+    fi
+    # `omarchy plugin add` accepts any git URL, including a local path, and
+    # clones the staging checkout's detached HEAD -- i.e. exactly the pinned
+    # commit -- while still running Omarchy's own manifest validation and
+    # id-collision checks. Only afterwards is origin pointed back at the
+    # real remote so future snapshots record the true upstream.
+    if ! omarchy plugin add "$stage" --yes >/dev/null 2>&1 || [ ! -d "$plugins_dir/$id/.git" ]; then
+      rm -rf -- "$stage"
+      ob_warn "Step failed: omarchy plugin add for '$id'"
+      ob_restore_note "Plugin '$id': 'omarchy plugin add' refused the pinned checkout (validation failed or id already taken); not installed or enabled -- install manually from $remote at $commit."
+      skip_enable+=("$id")
+      continue
+    fi
+    rm -rf -- "$stage"
+    git -C "$plugins_dir/$id" remote set-url origin "$remote" 2>/dev/null || true
+    if [ "$(git -C "$plugins_dir/$id" rev-parse HEAD 2>/dev/null)" != "$commit" ] \
+        && ! git -C "$plugins_dir/$id" -c advice.detachedHead=false checkout --quiet --detach "$commit" 2>/dev/null; then
+      ob_warn "Step failed: installed plugin '$id' is not at pinned commit $commit"
+      ob_restore_note "Plugin '$id' was installed but is not at pinned commit $commit; NOT enabled -- inspect $plugins_dir/$id before enabling."
+      skip_enable+=("$id")
+      continue
+    fi
+    echo "  -> plugin '$id' installed at pinned commit ${commit:0:12}"
+    if [ "$dirty" = "true" ] && [ -n "$diff" ]; then
+      if echo "$diff" | git -C "$plugins_dir/$id" apply --check - 2>/dev/null; then
+        echo "$diff" | git -C "$plugins_dir/$id" apply -
+        echo "  Reapplied local uncommitted changes to '$id'."
+      else
+        ob_restore_note "Plugin '$id' had local uncommitted changes that no longer apply cleanly; diff saved to $OB_DATA_DIR/restore-$id.diff for manual review."
+        echo "$diff" > "$OB_DATA_DIR/restore-$id.diff"
+      fi
+    fi
+  done < <(echo "$manifest" | jq -r '(.plugins.git_managed[]?.id // empty), (.plugins.local_managed[]? // empty)' | sort -u)
+
+  local enable_ids skip
+  enable_ids="$(echo "$manifest" | jq -r '.plugins.enabled[]?' 2>/dev/null)"
   if [ -n "$enable_ids" ] && ob_require_tool omarchy; then
     while IFS= read -r id; do
       [ -z "$id" ] && continue
+      if ! ob_restore_plugin_id_valid "$id"; then
+        ob_restore_note "Snapshot wants to enable a plugin with an invalid id ($(printf '%q' "$id")); ignored."
+        continue
+      fi
+      skip=false
+      local s
+      for s in "${skip_enable[@]}"; do [ "$s" = "$id" ] && skip=true; done
+      if [ "$skip" = true ]; then
+        echo "  Not enabling '$id': its pinned code was not installed (see manual steps)."
+        continue
+      fi
       ob_restore_run_step "enable plugin '$id'" omarchy plugin enable "$id"
     done <<< "$enable_ids"
   fi

@@ -41,10 +41,10 @@ Handled separately, not via `paths.conf`:
   recorded as name lists, not file content -- restore reinstalls them.
 - **Omarchy plugins**: a git-managed plugin (i.e. cloned via `omarchy plugin
   add`, which is how most third-party plugins arrive) is recorded as
-  `{remote url, commit, uncommitted diff}` and reinstalled with `omarchy
-  plugin add` + `git checkout` + reapplying the diff -- not copied
-  file-by-file. A plugin with **no** `.git` (i.e. your own, hand-written
-  plugin) is embedded in the snapshot payload directly.
+  `{remote url, full commit SHA, uncommitted diff}` and reinstalled at exactly
+  that commit (see restore step 2) -- not copied file-by-file. A plugin with
+  **no** `.git` (i.e. your own, hand-written plugin) is embedded in the
+  snapshot payload directly.
 - **AppImages**: only detected and listed (path + checksum) for you to
   re-fetch; not embedded (they're large, redistributable binaries).
 
@@ -250,11 +250,21 @@ as a manual step at the end rather than failing the whole restore.
 1. **Packages** -- installs missing native packages (`pacman -S --needed`)
    and AUR packages (`yay`/`paru -S --needed`; noted as a manual step if
    neither is installed).
-2. **Omarchy plugins** -- `omarchy plugin add <remote>` for each
-   git-managed plugin, checks out the recorded commit, reapplies any
-   uncommitted local diff (saved to `~/.local/share/omarchy-backup/restore-<id>.diff`
-   for manual review if it no longer applies cleanly), then re-enables
-   every previously-enabled plugin (built-in or third-party).
+2. **Omarchy plugins** -- for each git-managed plugin, clones the recorded
+   remote into a staging directory, checks out the recorded **full commit
+   SHA** detached, and only then hands that staging checkout to `omarchy
+   plugin add` (which runs Omarchy's own manifest validation and id checks
+   and clones exactly that commit). Origin is then pointed back at the real
+   remote. Any uncommitted local diff is reapplied (saved to
+   `~/.local/share/omarchy-backup/restore-<id>.diff` for manual review if it
+   no longer applies cleanly). Finally every previously-enabled plugin
+   (built-in or third-party) is re-enabled. A plugin whose pinned commit
+   cannot be found at its remote, whose recorded id/remote/commit is
+   malformed, or whose repository declares a different plugin id is **neither
+   installed nor enabled** -- it is listed as a manual step instead of
+   silently falling back to whatever upstream's default branch contains
+   today. The manifest's pin is what the snapshot promises; restore keeps
+   that promise or says so.
 3. **Scripts, dotfiles, themes, agent config, machine memory** -- the
    payload is extracted to `$HOME`. This one step covers `~/.local/bin`,
    Hyprland/Omarchy config, and the shared agent knowledge base +
@@ -291,6 +301,9 @@ to itself (the convention already used elsewhere on this machine).
   set up on the fresh machine first (`gh auth login` + `gh auth setup-git`,
   or SSH keys); otherwise that one plugin is skipped and listed as a
   manual step rather than failing the whole restore.
+- A git-managed plugin whose recorded commit no longer exists upstream
+  (history rewritten, repository replaced) -- deliberately not installed and
+  not enabled; review upstream yourself, then install manually.
 - Full bit-for-bit fidelity is explicitly a non-goal; the target is "fresh
   Omarchy -> functionally the same personal workspace."
 
