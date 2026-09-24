@@ -35,6 +35,88 @@ ob_remote_configured() {
   fi
 }
 
+# Every write to the destination is gated by ob_remote_ensure_available:
+#   1. The configured destination root must already exist (local path) or the
+#      rclone remote must answer -- the tool never creates the root itself, so
+#      an unmounted drive/mountpoint can't silently receive the backup on the
+#      local disk.
+#   2. Identity marker: the first push writes a random id to
+#      <root>/.omarchy-backup-destination and remembers it in state.json
+#      (.destinations[<root>]). Later writes require exactly that marker, which
+#      also catches an existing-but-empty mountpoint or a different drive
+#      mounted at the same path. A fresh install (empty state) adopts an
+#      existing marker, so restores onto new machines keep working.
+OB_DESTINATION_MARKER=".omarchy-backup-destination"
+
+ob_remote_root() {
+  if [ -n "${OB_CFG_REMOTE_NAME:-}" ]; then
+    echo "${OB_CFG_REMOTE_NAME}:${OB_CFG_REMOTE_PATH%/}"
+  else
+    echo "${OB_CFG_REMOTE_PATH%/}"
+  fi
+}
+
+ob_remote_read_marker() {
+  timeout --signal=TERM --kill-after=5s "${OB_REMOTE_INDEX_TIMEOUT_SECONDS}s" \
+    rclone cat "$1/$OB_DESTINATION_MARKER" --count 200 2>/dev/null \
+    | head -n 1 | tr -cd 'A-Za-z0-9-'
+}
+
+# Usage: ob_remote_ensure_available [--check]
+# --check never writes (doctor, pre-flight of automatic runs).
+ob_remote_ensure_available() {
+  local check_only=false
+  [ "${1:-}" = "--check" ] && check_only=true
+  ob_remote_configured || { ob_err "No remote backup destination configured."; return 1; }
+  local root expected actual id tmp state
+  root="$(ob_remote_root)"
+
+  if [ -z "${OB_CFG_REMOTE_NAME:-}" ]; then
+    if [ ! -d "$root" ]; then
+      ob_err "Backup destination '$root' does not exist (drive/share not mounted?); refusing to write. The destination folder is never created automatically."
+      return 1
+    fi
+    if [ ! -w "$root" ]; then
+      ob_err "Backup destination '$root' is not writable; refusing to write."
+      return 1
+    fi
+  elif ! timeout --signal=TERM --kill-after=5s 30s \
+      rclone lsf --max-depth 1 "${OB_CFG_REMOTE_NAME}:" >/dev/null 2>&1; then
+    ob_err "rclone remote '${OB_CFG_REMOTE_NAME}:' is not reachable (offline or not authenticated?); refusing to write."
+    return 1
+  fi
+
+  expected="$(ob_state_read | jq -r --arg d "$root" '.destinations[$d] // empty')"
+  actual="$(ob_remote_read_marker "$root")"
+  if [ -n "$expected" ]; then
+    if [ "$actual" != "$expected" ]; then
+      ob_err "Backup destination '$root' is missing its identity marker ($OB_DESTINATION_MARKER, expected $expected, found '${actual:-none}') -- probably not mounted, or a different drive is attached; refusing to write."
+      return 1
+    fi
+    return 0
+  fi
+
+  # First use of this destination on this machine.
+  [ "$check_only" = "true" ] && return 0
+  if [ -n "$actual" ]; then
+    id="$actual"
+  else
+    id="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || date +%s%N)"
+    tmp="$(mktemp)" || return 1
+    printf '%s\n' "$id" > "$tmp"
+    if ! timeout --signal=TERM --kill-after=5s "${OB_REMOTE_INDEX_TIMEOUT_SECONDS}s" \
+        rclone copyto "$tmp" "$root/$OB_DESTINATION_MARKER" >/dev/null 2>&1; then
+      rm -f -- "$tmp"
+      ob_err "Could not write the identity marker to '$root'; refusing to write."
+      return 1
+    fi
+    rm -f -- "$tmp"
+    ob_info "Registered backup destination '$root' (identity marker $OB_DESTINATION_MARKER)."
+  fi
+  state="$(ob_state_read | jq --arg d "$root" --arg id "$id" '.destinations = ((.destinations // {}) + {($d): $id})')" || return 1
+  ob_state_write "$state"
+}
+
 ob_remote_base() {
   if [ -n "${OB_CFG_REMOTE_NAME:-}" ]; then
     echo "${OB_CFG_REMOTE_NAME}:${OB_CFG_REMOTE_PATH%/}/$(ob_hostname)"
@@ -87,42 +169,51 @@ ob_remote_index_valid() {
 # Remote input is hostile until proven otherwise. `--count` bounds bytes at
 # the producer, while coreutils timeout puts a hard wall-clock limit around
 # even a wedged backend. Exit 3 means the index does not exist yet.
+#
+# Caching/eventually-consistent destinations can briefly serve stale or
+# zero-filled content right after the index was replaced (observed with an
+# rclone VFS mount: first read after `copyto` returned only NUL bytes). An
+# invalid read is therefore retried a few times before it counts as corrupt.
+OB_REMOTE_INDEX_READ_ATTEMPTS=5
+
 ob_remote_read_index() {
-  local base="$1" target tmp rc size
+  local base="$1" target tmp rc size attempt
   target="$(ob_remote_index_target "$base")" || return 1
   tmp="$(mktemp)" || return 1
-  timeout --signal=TERM --kill-after=5s "${OB_REMOTE_INDEX_TIMEOUT_SECONDS}s" \
-    rclone cat "$target" --count "$((OB_REMOTE_INDEX_MAX_BYTES + 1))" \
-    > "$tmp" 2>/dev/null
-  rc=$?
-  if [ "$rc" -ne 0 ]; then
-    rm -f -- "$tmp"
-    if [ "$rc" -eq 3 ]; then
-      return 3
+  for ((attempt = 1; attempt <= OB_REMOTE_INDEX_READ_ATTEMPTS; attempt++)); do
+    [ "$attempt" -gt 1 ] && sleep 1
+    timeout --signal=TERM --kill-after=5s "${OB_REMOTE_INDEX_TIMEOUT_SECONDS}s" \
+      rclone cat "$target" --count "$((OB_REMOTE_INDEX_MAX_BYTES + 1))" \
+      > "$tmp" 2>/dev/null
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      rm -f -- "$tmp"
+      if [ "$rc" -eq 3 ]; then
+        return 3
+      fi
+      ob_err "Could not read remote snapshot index within the safety deadline."
+      return 1
     fi
-    ob_err "Could not read remote snapshot index within the safety deadline."
-    return 1
-  fi
-  size="$(stat -c '%s' -- "$tmp" 2>/dev/null || echo "$((OB_REMOTE_INDEX_MAX_BYTES + 1))")"
-  if [ "$size" -gt "$OB_REMOTE_INDEX_MAX_BYTES" ]; then
-    rm -f -- "$tmp"
-    ob_err "Remote snapshot index exceeds the ${OB_REMOTE_INDEX_MAX_BYTES}-byte safety limit."
-    return 1
-  fi
-  if ! ob_remote_index_valid "$tmp"; then
-    rm -f -- "$tmp"
-    ob_err "Remote snapshot index has an invalid or unsafe schema."
-    return 1
-  fi
-  cat -- "$tmp"
+    size="$(stat -c '%s' -- "$tmp" 2>/dev/null || echo "$((OB_REMOTE_INDEX_MAX_BYTES + 1))")"
+    if [ "$size" -gt "$OB_REMOTE_INDEX_MAX_BYTES" ]; then
+      rm -f -- "$tmp"
+      ob_err "Remote snapshot index exceeds the ${OB_REMOTE_INDEX_MAX_BYTES}-byte safety limit."
+      return 1
+    fi
+    if ob_remote_index_valid "$tmp"; then
+      cat -- "$tmp"
+      rm -f -- "$tmp"
+      return 0
+    fi
+  done
   rm -f -- "$tmp"
+  ob_err "Remote snapshot index has an invalid or unsafe schema."
+  return 1
 }
 
 ob_remote_check() {
-  # Cheap connectivity/writability probe for `doctor`.
-  ob_remote_configured || return 1
-  timeout --signal=TERM --kill-after=5s 30s rclone lsd "$(ob_remote_base)" >/dev/null 2>&1 \
-    || timeout --signal=TERM --kill-after=5s 30s rclone mkdir "$(ob_remote_base)" >/dev/null 2>&1
+  # Read-only availability probe for `doctor` -- never creates anything.
+  ob_remote_ensure_available --check 2>/dev/null
 }
 
 ob_remote_push() {
@@ -131,6 +222,7 @@ ob_remote_push() {
   ob_remote_configured || ob_die "No remote configured (set OB_CFG_REMOTE_NAME in $OB_CONFIG_FILE)."
   local dir="$OB_SNAPSHOTS_DIR/$name"
   ob_snapshot_verify_for_push "$name" || return 1
+  ob_remote_ensure_available || return 1
   local base target
   base="$(ob_remote_base)"
   target="$(ob_remote_snapshot_target "$base" "$name")" \
@@ -239,12 +331,23 @@ ob_remote_enforce_retention() {
       ob_err "Refusing unsafe remote snapshot name from index: '$n'"
       return 1
     }
-    ob_info "Removing old remote snapshot beyond retention ($keep): $n"
-    if ! timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS}s" \
-        rclone purge "$target" >/dev/null 2>&1; then
-      ob_err "Could not remove expired remote snapshot '$n'; keeping the unpruned index for recovery."
-      return 1
+    # A snapshot pruned by an earlier push can reappear in the index via the
+    # local state (it still says remote_pushed=true); purging a directory
+    # that is already gone must not fail the whole push.
+    if ! timeout --signal=TERM --kill-after=5s "${OB_REMOTE_INDEX_TIMEOUT_SECONDS}s" \
+        rclone lsf --max-depth 1 "$target" >/dev/null 2>&1; then
+      ob_info "Expired remote snapshot already absent: $n"
+    else
+      ob_info "Removing old remote snapshot beyond retention ($keep): $n"
+      if ! timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS}s" \
+          rclone purge "$target" >/dev/null 2>&1; then
+        ob_err "Could not remove expired remote snapshot '$n'; keeping the unpruned index for recovery."
+        return 1
+      fi
     fi
+    local pruned_state
+    pruned_state="$(ob_state_read | jq --arg n "$n" '.snapshots |= map(if .name==$n then .remote_pushed=false else . end)')" \
+      && ob_state_write "$pruned_state"
   done <<< "$excess"
   local tmp index_target; tmp="$(mktemp)"
   echo "$retained" | jq . > "$tmp"

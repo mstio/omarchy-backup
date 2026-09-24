@@ -469,6 +469,97 @@ out="$(HOME="$DRY_HOME" PATH="$STUB_BIN:$PATH" omarchy-backup restore pinned --d
 assert_contains "dry run shows the pin it would enforce" "$out" "pinned at $PINNED"
 assert_not_file "dry run clones nothing" "$DRY_HOME/.config/omarchy/plugins/mst.pinned"
 
+echo "== pruned remote snapshots do not break later pushes =="
+HOME="$(new_home home_prune_repeat)"
+omarchy-backup init >/dev/null 2>&1
+configure_remote "$HOME" prune-repeat
+sed -i 's/^OB_CFG_RETENTION_REMOTE=.*/OB_CFG_RETENTION_REMOTE=2/' "$HOME/.config/omarchy-backup/config.conf"
+seed_workspace "$HOME"
+for n in pr-1 pr-2 pr-3; do
+  omarchy-backup snapshot "$n" >/dev/null 2>&1
+  omarchy-backup push "$n" >/dev/null 2>&1
+done
+out="$(omarchy-backup push pr-3 2>&1)"; rc=$?
+assert_eq "re-push after retention pruning succeeds" "0" "$rc"
+assert_not_contains "already-pruned snapshot is not reported as a removal failure" "$out" "Could not remove expired"
+assert_eq "pruned snapshot is no longer marked as pushed locally" "false" \
+  "$(jq -r '.snapshots[] | select(.name=="pr-1") | .remote_pushed' "$HOME/.local/share/omarchy-backup/state.json")"
+
+echo "== a transiently zero-filled index read (caching mount) is retried =="
+HOME="$(new_home home_flaky_index)"
+omarchy-backup init >/dev/null 2>&1
+configure_remote "$HOME" flaky-index
+seed_workspace "$HOME"
+omarchy-backup snapshot fl-1 >/dev/null 2>&1
+omarchy-backup push fl-1 >/dev/null 2>&1
+FLAKY_BIN="$WORK/flaky-bin"; mkdir -p "$FLAKY_BIN"
+REAL_RCLONE="$(command -v rclone)"
+cat > "$FLAKY_BIN/rclone" <<FLAKY
+#!/bin/bash
+# First 'cat' of index.json per marker returns zeros, like a VFS cache race.
+if [ "\$1" = "cat" ] && [[ "\$2" == */index.json ]] && [ ! -e "$WORK/flaky-served" ]; then
+  touch "$WORK/flaky-served"; head -c 400 /dev/zero; exit 0
+fi
+exec "$REAL_RCLONE" "\$@"
+FLAKY
+chmod +x "$FLAKY_BIN/rclone"
+omarchy-backup snapshot fl-2 >/dev/null 2>&1
+out="$(PATH="$FLAKY_BIN:$PATH" omarchy-backup push fl-2 2>&1)"; rc=$?
+assert_file "flaky rclone stub was actually exercised" "$WORK/flaky-served"
+assert_eq "push survives one zero-filled index read" "0" "$rc"
+assert_not_contains "transient read is not reported as a corrupt index" "$out" "invalid or unsafe schema"
+
+echo "== backup destination must be available before any write =="
+HOME="$(new_home home_dest_guard)"
+omarchy-backup init >/dev/null 2>&1
+seed_workspace "$HOME"
+GUARD_DEST="$WORK/guard-dest"
+mkdir -p "$GUARD_DEST"
+sed -i "s|^OB_CFG_REMOTE_NAME=.*|OB_CFG_REMOTE_NAME=''|" "$HOME/.config/omarchy-backup/config.conf"
+sed -i "s|^OB_CFG_REMOTE_PATH=.*|OB_CFG_REMOTE_PATH=$GUARD_DEST|" "$HOME/.config/omarchy-backup/config.conf"
+omarchy-backup snapshot g-base --baseline >/dev/null 2>&1
+out="$(omarchy-backup push g-base 2>&1)"
+assert_contains "first push registers the destination" "$out" "Registered backup destination"
+assert_file "identity marker written to destination root" "$GUARD_DEST/.omarchy-backup-destination"
+guard_id="$(cat "$GUARD_DEST/.omarchy-backup-destination")"
+
+mv "$GUARD_DEST" "$GUARD_DEST.unmounted"          # drive not mounted at all
+out="$(omarchy-backup push g-base 2>&1)"; rc=$?
+assert_eq "push to a missing destination fails" "1" "$rc"
+assert_contains "missing destination is explained" "$out" "does not exist"
+assert_not_file "missing destination folder is never recreated" "$GUARD_DEST"
+
+mkdir -p "$GUARD_DEST"                              # empty mountpoint left behind
+out="$(omarchy-backup push g-base 2>&1)"; rc=$?
+assert_eq "push into an empty mountpoint fails" "1" "$rc"
+assert_contains "missing identity marker is explained" "$out" "identity marker"
+assert_eq "nothing was written into the empty mountpoint" "0" "$(find "$GUARD_DEST" -mindepth 1 | wc -l)"
+
+echo "drift = true" >> "$HOME/.config/hypr/looknfeel.lua"
+out="$(omarchy-backup snapshot g-auto --auto 2>&1)"; rc=$?
+assert_eq "automatic run with unavailable destination exits 75 (retry later)" "75" "$rc"
+assert_contains "automatic run explains the postponement" "$out" "postponing automatic snapshot"
+assert_not_file "no snapshot is created while the destination is unavailable" \
+  "$HOME/.local/share/omarchy-backup/snapshots/g-auto"
+doctor_out="$(omarchy-backup doctor 2>&1)"
+assert_contains "doctor reports the unavailable destination with its reason" "$doctor_out" "identity marker"
+
+rmdir "$GUARD_DEST"; mv "$GUARD_DEST.unmounted" "$GUARD_DEST"   # drive is back
+out="$(omarchy-backup snapshot g-auto2 --auto 2>&1)"
+assert_contains "automatic run proceeds once the destination is back" "$out" "Upload complete and verified"
+
+HOME="$(new_home home_dest_guard_fresh)"          # fresh install, same destination
+omarchy-backup init >/dev/null 2>&1
+seed_workspace "$HOME"
+sed -i "s|^OB_CFG_REMOTE_NAME=.*|OB_CFG_REMOTE_NAME=''|" "$HOME/.config/omarchy-backup/config.conf"
+sed -i "s|^OB_CFG_REMOTE_PATH=.*|OB_CFG_REMOTE_PATH=$GUARD_DEST|" "$HOME/.config/omarchy-backup/config.conf"
+omarchy-backup snapshot g-fresh >/dev/null 2>&1
+out="$(omarchy-backup push g-fresh 2>&1)"
+assert_contains "fresh install pushes to an existing destination" "$out" "Upload complete"
+assert_not_contains "fresh install adopts the existing marker" "$out" "Registered backup destination"
+assert_eq "adopted marker id is remembered" "$guard_id" \
+  "$(jq -r --arg d "$GUARD_DEST" '.destinations[$d]' "$HOME/.local/share/omarchy-backup/state.json")"
+
 echo
 echo "== Summary: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]

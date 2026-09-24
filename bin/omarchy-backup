@@ -133,6 +133,14 @@ ob_cmd_snapshot() {
       fi
     fi
   fi
+  # Automatic runs check the backup destination BEFORE creating anything: a
+  # snapshot that can't leave the machine is postponed instead. Exit 75
+  # (EX_TEMPFAIL) makes the systemd unit retry later.
+  if [ "$auto" = "true" ] && ob_remote_configured && ! ob_remote_ensure_available --check; then
+    ob_err "Backup destination unavailable; postponing automatic snapshot (will retry)."
+    return 75
+  fi
+
   OB_SNAPSHOT_NAME="$name"
   export OB_SNAPSHOT_NAME
   if ! ob_snapshot_create; then

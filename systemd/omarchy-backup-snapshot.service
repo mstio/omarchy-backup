@@ -1,7 +1,15 @@
 [Unit]
 Description=omarchy-backup: automatic snapshot
 ConditionPathExists=%h/.config/omarchy-backup/config.conf
+# Retry only when the backup destination was unavailable (exit 75), e.g. a
+# catch-up run right after boot/resume before a drive or network share is
+# mounted. At most 4 attempts in 3 hours.
+StartLimitIntervalSec=3h
+StartLimitBurst=4
 
 [Service]
 Type=oneshot
 ExecStart=@EXEC@ snapshot --auto
+Restart=on-failure
+RestartPreventExitStatus=1
+RestartSec=15min

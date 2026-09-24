@@ -149,7 +149,11 @@ install` after changing either frequency in config.conf.
   rolling snapshot and automatically pushes it when a remote destination is
   configured. RED/UNKNOWN states are refused: repair or establish the
   known-good baseline first. A missing remote leaves the snapshot local and
-  emits a warning.
+  emits a warning. If a remote **is** configured but currently unavailable
+  (see "Destination availability" below), the automatic run creates nothing
+  and exits with 75; the systemd unit then retries every 15 minutes (at most
+  4 attempts in 3 hours) -- typical for a catch-up run right after boot or
+  resume, before a drive or network share is mounted.
 - An automatic `doctor --auto` run that comes back DEGRADED sends a desktop
   notification (`notify-send`) in addition to the journal log, since a log
   line nobody reads isn't "visible" to you.
@@ -222,6 +226,28 @@ account according to your own threat model, use its access controls/version
 history, and review a remote restore with `--dry-run` when appropriate. Restore
 remains an explicit user-controlled operation: the tool provides the mechanism
 and evidence, while the user owns the decision to apply a self-created state.
+
+### Destination availability
+
+Every write to the destination (push, index update, retention) is gated,
+for both destination modes:
+
+1. **The destination root must already exist** (local/mounted path) or the
+   rclone remote must answer. The tool never creates the configured root
+   itself -- otherwise an unmounted drive would silently receive the backup
+   in its empty mountpoint on the local disk.
+2. **Identity marker**: the first push writes a random id to
+   `<remote_path>/.omarchy-backup-destination` and remembers it in
+   `state.json` (`.destinations`). Later writes require exactly that marker,
+   which also catches an existing-but-empty mountpoint or a different drive
+   mounted at the same path. A fresh install (empty state) adopts an existing
+   marker, so restoring onto a new machine keeps working. To deliberately
+   switch to a new empty destination, just configure the new path -- markers
+   are tracked per destination.
+
+`doctor` performs the same check read-only and reports the concrete reason.
+Index reads are retried briefly, because caching mounts can serve stale or
+zero-filled content right after the index was replaced.
 
 ## Restore (fresh Omarchy install -> your workspace)
 

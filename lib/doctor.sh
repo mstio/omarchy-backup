@@ -107,10 +107,14 @@ ob_doctor_run() {
   # Remote backup
   if ! ob_remote_configured; then
     ob_doctor_check "Remote backup" "WARN" "not configured -- Fix: set a backup destination (bar widget Options, or \`omarchy-backup config set OB_CFG_REMOTE_PATH <absolute-folder>\`)."
-  elif ob_remote_check; then
-    ob_doctor_check "Remote backup" "OK"
   else
-    ob_doctor_check "Remote backup" "FAIL" "destination '$(ob_remote_base)' not reachable/writable -- Fix: check it's mounted/reachable and you have write permission there."
+    local remote_reason
+    if remote_reason="$(ob_remote_ensure_available --check 2>&1)"; then
+      ob_doctor_check "Remote backup" "OK"
+    else
+      remote_reason="$(printf '%s' "$remote_reason" | sed -E 's/^\[[^]]*\] *(ERROR|ERR)? *//' | tail -n 1)"
+      ob_doctor_check "Remote backup" "FAIL" "${remote_reason:-destination '$(ob_remote_root)' not available} -- Fix: check it's mounted/reachable and you have write permission there."
+    fi
   fi
 
   # Can we still create a snapshot? (tools + writable data dir; no actual snapshot taken)
