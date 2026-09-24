@@ -150,10 +150,12 @@ install` after changing either frequency in config.conf.
   configured. RED/UNKNOWN states are refused: repair or establish the
   known-good baseline first. A missing remote leaves the snapshot local and
   emits a warning. If a remote **is** configured but currently unavailable
-  (see "Destination availability" below), the automatic run creates nothing
-  and exits with 75; the systemd unit then retries every 15 minutes (at most
-  4 attempts in 3 hours) -- typical for a catch-up run right after boot or
-  resume, before a drive or network share is mounted.
+  (see "Destination availability" below), the run is still **local first**:
+  the snapshot is created locally, only the upload is postponed, and the run
+  exits with 75; the systemd unit then retries every 15 minutes (at most 4
+  attempts in 3 hours). A retry first uploads pending snapshots (latest and
+  current baseline) and never creates a duplicate: automatic runs skip
+  creating a new snapshot when nothing changed since the latest local one.
 - An automatic `doctor --auto` run that comes back DEGRADED sends a desktop
   notification (`notify-send`) in addition to the journal log, since a log
   line nobody reads isn't "visible" to you.

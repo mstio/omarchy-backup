@@ -133,12 +133,26 @@ ob_cmd_snapshot() {
       fi
     fi
   fi
-  # Automatic runs check the backup destination BEFORE creating anything: a
-  # snapshot that can't leave the machine is postponed instead. Exit 75
-  # (EX_TEMPFAIL) makes the systemd unit retry later.
-  if [ "$auto" = "true" ] && ob_remote_configured && ! ob_remote_ensure_available --check; then
-    ob_err "Backup destination unavailable; postponing automatic snapshot (will retry)."
-    return 75
+  # Local first: an automatic run always secures the state locally, and the
+  # upload is a separate, optional second step. When the destination is
+  # unavailable the snapshot stays local and the run exits 75 (EX_TEMPFAIL),
+  # so the systemd unit retries -- the retry only uploads what is pending and
+  # never creates a duplicate snapshot.
+  local remote_ok=false
+  if [ "$auto" = "true" ]; then
+    if ob_remote_configured && ob_remote_ensure_available --check; then
+      remote_ok=true
+      ob_remote_push_pending || true
+    fi
+    local latest; latest="$(ob_latest_snapshot_name)"
+    if [ -n "$latest" ] && ob_unchanged_since_snapshot "$latest"; then
+      ob_info "No changes since the latest local snapshot '$latest'; not creating a new one."
+      if ob_remote_configured && ob_remote_has_pending; then
+        ob_warn "Snapshot '$latest' is still local only; the upload will be retried."
+        return 75
+      fi
+      return 0
+    fi
   fi
 
   OB_SNAPSHOT_NAME="$name"
@@ -149,11 +163,14 @@ ob_cmd_snapshot() {
   fi
 
   if [ "$auto" = "true" ]; then
-    if ob_remote_configured; then
-      ob_info "Automatic $status_color snapshot created; uploading it to the configured backup destination."
+    if ! ob_remote_configured; then
+      ob_warn "No usable remote backup destination is configured; automatic snapshot '$OB_CREATED_SNAPSHOT_NAME' remains local only."
+    elif [ "$remote_ok" = "true" ] && ob_remote_ensure_available --check; then
+      ob_info "Automatic $status_color snapshot created locally; uploading it to the configured backup destination."
       ob_remote_push "$OB_CREATED_SNAPSHOT_NAME" || return 1
     else
-      ob_warn "No usable remote backup destination is configured; automatic snapshot '$OB_CREATED_SNAPSHOT_NAME' remains local only."
+      ob_warn "Automatic snapshot '$OB_CREATED_SNAPSHOT_NAME' was created locally, but the backup destination is unavailable; the upload will be retried."
+      return 75
     fi
   fi
 }

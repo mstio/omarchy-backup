@@ -253,6 +253,30 @@ ob_remote_push() {
   ob_info "Upload complete and verified."
 }
 
+# Uploads what an earlier automatic run could not: the latest local snapshot
+# and the current baseline, if either is not on the remote yet. Older
+# unpushed rolling snapshots are superseded by the latest one and skipped.
+ob_remote_push_pending() {
+  local latest baseline n rc=0
+  latest="$(ob_latest_snapshot_name)"
+  baseline="$(ob_state_baseline_name)"
+  for n in $(printf '%s\n%s\n' "$baseline" "$latest" | awk 'NF && !seen[$0]++'); do
+    if [ "$(ob_state_read | jq -r --arg n "$n" '.snapshots[] | select(.name==$n) | .remote_pushed // false')" != "true" ]; then
+      ob_info "Uploading pending snapshot '$n' from an earlier run."
+      ob_remote_push "$n" || rc=1
+    fi
+  done
+  return "$rc"
+}
+
+ob_remote_has_pending() {
+  local latest baseline
+  latest="$(ob_latest_snapshot_name)"
+  baseline="$(ob_state_baseline_name)"
+  ob_state_read | jq -e --arg l "$latest" --arg b "$baseline" \
+    '[.snapshots[] | select((.name==$l or .name==$b) and (.remote_pushed // false) != true)] | length > 0' >/dev/null
+}
+
 ob_snapshot_verify_for_push() {
   local name="$1" dir="$OB_SNAPSHOTS_DIR/$1" required
   for required in manifest.json checksums.sha256 payload.tar.zst; do

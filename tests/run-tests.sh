@@ -573,15 +573,25 @@ assert_eq "nothing was written into the empty mountpoint" "0" "$(find "$GUARD_DE
 echo "drift = true" >> "$HOME/.config/hypr/looknfeel.lua"
 out="$(omarchy-backup snapshot g-auto --auto 2>&1)"; rc=$?
 assert_eq "automatic run with unavailable destination exits 75 (retry later)" "75" "$rc"
-assert_contains "automatic run explains the postponement" "$out" "postponing automatic snapshot"
-assert_not_file "no snapshot is created while the destination is unavailable" \
-  "$HOME/.local/share/omarchy-backup/snapshots/g-auto"
+assert_file "local first: the snapshot is still created locally" \
+  "$HOME/.local/share/omarchy-backup/snapshots/g-auto/payload.tar.zst"
+assert_contains "automatic run explains that only the upload is pending" "$out" "upload will be retried"
+assert_eq "nothing was written into the empty mountpoint by the automatic run" "0" "$(find "$GUARD_DEST" -mindepth 1 | wc -l)"
+out="$(omarchy-backup snapshot g-retry --auto 2>&1)"; rc=$?
+assert_eq "retry while still unavailable exits 75 again" "75" "$rc"
+assert_not_file "retry does not create a duplicate snapshot" "$HOME/.local/share/omarchy-backup/snapshots/g-retry"
 doctor_out="$(omarchy-backup doctor 2>&1)"
 assert_contains "doctor reports the unavailable destination with its reason" "$doctor_out" "identity marker"
 
 rmdir "$GUARD_DEST"; mv "$GUARD_DEST.unmounted" "$GUARD_DEST"   # drive is back
-out="$(omarchy-backup snapshot g-auto2 --auto 2>&1)"
-assert_contains "automatic run proceeds once the destination is back" "$out" "Upload complete and verified"
+out="$(omarchy-backup snapshot g-retry2 --auto 2>&1)"; rc=$?
+assert_eq "retry after the destination is back succeeds" "0" "$rc"
+assert_contains "retry uploads the pending local snapshot" "$out" "Uploading pending snapshot 'g-auto'"
+assert_not_file "retry after recovery still creates no duplicate" "$HOME/.local/share/omarchy-backup/snapshots/g-retry2"
+assert_file "pending snapshot reached the destination" "$GUARD_DEST/$(hostname)/g-auto/payload.tar.zst"
+echo "more drift = true" >> "$HOME/.config/hypr/looknfeel.lua"
+out="$(omarchy-backup snapshot g-auto3 --auto 2>&1)"
+assert_contains "a real change afterwards is snapshotted and uploaded" "$out" "Upload complete and verified"
 
 HOME="$(new_home home_dest_guard_fresh)"          # fresh install, same destination
 omarchy-backup init >/dev/null 2>&1

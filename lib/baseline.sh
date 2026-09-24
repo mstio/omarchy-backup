@@ -195,3 +195,31 @@ ob_status_color_only() {
   color="${first_line#Status: }"
   printf '%s\n' "${color%% *}"
 }
+
+# Latest local snapshot by creation time (empty if none).
+ob_latest_snapshot_name() {
+  ob_state_read | jq -r '[.snapshots[]] | sort_by(.created_at) | last | .name // empty'
+}
+
+# Returns 0 when the live state -- included files, explicit/AUR packages and
+# plugins, i.e. what `status` compares -- is identical to the given local
+# snapshot. Used by automatic runs so that a retry (or a day without changes)
+# never creates a duplicate snapshot that would rotate a real one away.
+ob_unchanged_since_snapshot() {
+  local dir="$OB_SNAPSHOTS_DIR/$1"
+  [ -f "$dir/manifest.json" ] && [ -f "$dir/checksums.sha256" ] || return 1
+  local OB_SKIPPED_LARGE=() OB_SKIPPED_SECRET=()
+  ob_read_path_rules   # status loads the rules only inside its own subshell
+  ob_resolve_included_files
+  local live; live="$(mktemp)" || return 1
+  if ! ob_write_checksums "$live" "${OB_RESOLVED_FILES[@]}" \
+      || ! cmp -s <(sort "$live") <(sort "$dir/checksums.sha256"); then
+    rm -f -- "$live"
+    return 1
+  fi
+  rm -f -- "$live"
+  local filter='{p: ((.packages.pacman_explicit + .packages.aur_foreign) | sort),
+                 e: (.plugins.enabled | sort),
+                 g: ([.plugins.git_managed[] | {id, commit, dirty}] | sort_by(.id))}'
+  [ "$(ob_inv_all | jq -cS "$filter")" = "$(jq -cS "$filter" "$dir/manifest.json")" ]
+}
