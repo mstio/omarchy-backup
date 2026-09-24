@@ -283,14 +283,34 @@ ob_remote_refresh_index() {
     read_rc=$?
     [ "$read_rc" -eq 3 ] || return 1
   fi
-  local current index
+  local current index current_baseline
   current="$(ob_state_read | jq '{schema_version:1, snapshots:[.snapshots[] | select(.remote_pushed==true) | {name,created_at,baseline,omarchy_version,size_bytes}]}')"
-  index="$(jq -n --argjson existing "$existing" --argjson current "$current" '
-    {
-      schema_version: 1,
-      snapshots: ((reduce (($existing.snapshots // []) + ($current.snapshots // []))[] as $snapshot
-        ({}; .[$snapshot.name] = $snapshot)) | [.[]] | sort_by(.created_at))
-    }
+  # Only the baseline the user most recently set on purpose (`baseline <name>`
+  # or `snapshot --baseline`; automatic runs never set one) is protected on
+  # the remote. Earlier baselines -- including ones whose local slot has
+  # already rotated away and would otherwise keep baseline=true in the remote
+  # index forever -- are demoted and rotate like rolling snapshots. Demotion
+  # only happens once the current baseline is actually on the remote, so the
+  # remote is never left without a protected baseline.
+  current_baseline="$(ob_state_baseline_name)"
+  index="$(jq -n --argjson existing "$existing" --argjson current "$current" --arg cb "$current_baseline" '
+    ((reduce (($existing.snapshots // []) + ($current.snapshots // []))[] as $snapshot
+      ({}; .[$snapshot.name] = $snapshot)) | [.[]] | sort_by(.created_at)) as $merged
+    | {
+        schema_version: 1,
+        snapshots: (if $cb != "" and ($merged | map(.name) | index($cb)) != null
+                    then $merged | map(.baseline = (.name == $cb))
+                    else
+                      # Current baseline not uploaded yet (or none set on this
+                      # machine): the remote keeps the protection it already
+                      # records; local demotions must not strip it.
+                      [($existing.snapshots // [])[] | select(.baseline == true) | .name] as $eb
+                      | [($existing.snapshots // [])[] | .name] as $known
+                      | $merged | map(.baseline = (
+                          (.name as $n | $eb | index($n)) != null
+                          or ((.name as $n | $known | index($n)) == null and .baseline == true)))
+                    end)
+      }
   ')" || return 1
   local tmp target; tmp="$(mktemp)"
   echo "$index" | jq . > "$tmp"

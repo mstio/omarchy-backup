@@ -227,6 +227,17 @@ history, and review a remote restore with `--dry-run` when appropriate. Restore
 remains an explicit user-controlled operation: the tool provides the mechanism
 and evidence, while the user owns the decision to apply a self-created state.
 
+### Which baseline is protected remotely
+
+Remote retention always keeps **the baseline you most recently set on
+purpose** (`omarchy-backup baseline <name>` or `snapshot --baseline`;
+automatic runs never set one) and fills the remaining
+`OB_CFG_RETENTION_REMOTE` slots with the newest rolling snapshots. Earlier
+baselines are demoted in the remote index and rotate out like rolling
+snapshots -- including ones whose local slot has already rotated away. The
+switch happens only once the newly set baseline has actually been pushed, so
+the remote is never without a protected baseline.
+
 ### Destination availability
 
 Every write to the destination (push, index update, retention) is gated,

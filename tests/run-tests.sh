@@ -509,6 +509,41 @@ assert_file "flaky rclone stub was actually exercised" "$WORK/flaky-served"
 assert_eq "push survives one zero-filled index read" "0" "$rc"
 assert_not_contains "transient read is not reported as a corrupt index" "$out" "invalid or unsafe schema"
 
+echo "== only the most recently set baseline is protected on the remote =="
+HOME="$(new_home home_baseline_switch)"
+omarchy-backup init >/dev/null 2>&1
+configure_remote "$HOME" baseline-switch
+sed -i 's/^OB_CFG_RETENTION_REMOTE=.*/OB_CFG_RETENTION_REMOTE=3/' "$HOME/.config/omarchy-backup/config.conf"
+seed_workspace "$HOME"
+BS_IDX="$REMOTE_STORAGE/baseline-switch/$(hostname)/index.json"
+omarchy-backup snapshot bs-old --baseline >/dev/null 2>&1
+omarchy-backup push bs-old >/dev/null 2>&1
+# The old baseline's local slot rotates away: it now exists only remotely.
+jq '.snapshots |= map(select(.name != "bs-old"))' "$HOME/.local/share/omarchy-backup/state.json" > "$WORK/bs-state" \
+  && mv "$WORK/bs-state" "$HOME/.local/share/omarchy-backup/state.json"
+rm -rf "$HOME/.local/share/omarchy-backup/snapshots/bs-old"
+omarchy-backup snapshot bs-new --baseline >/dev/null 2>&1
+omarchy-backup push bs-new >/dev/null 2>&1
+assert_eq "new manual baseline is the only protected remote baseline" "bs-new" \
+  "$(jq -r '[.snapshots[] | select(.baseline==true) | .name] | join(",")' "$BS_IDX")"
+assert_eq "remote-only old baseline is demoted" "false" \
+  "$(jq -r '.snapshots[] | select(.name=="bs-old") | .baseline' "$BS_IDX")"
+omarchy-backup snapshot bs-unpushed >/dev/null 2>&1
+omarchy-backup baseline bs-unpushed >/dev/null 2>&1
+omarchy-backup snapshot bs-r1 >/dev/null 2>&1
+omarchy-backup push bs-r1 >/dev/null 2>&1
+assert_eq "remote keeps its baseline while the newly set one is not uploaded yet" "bs-new" \
+  "$(jq -r '[.snapshots[] | select(.baseline==true) | .name] | join(",")' "$BS_IDX")"
+omarchy-backup snapshot bs-r2 >/dev/null 2>&1
+omarchy-backup push bs-r2 >/dev/null 2>&1
+assert_not_file "demoted old baseline rotates out like a rolling snapshot" \
+  "$REMOTE_STORAGE/baseline-switch/$(hostname)/bs-old"
+assert_file "protected baseline survives rotation" \
+  "$REMOTE_STORAGE/baseline-switch/$(hostname)/bs-new/payload.tar.zst"
+omarchy-backup push bs-unpushed >/dev/null 2>&1
+assert_eq "baseline protection moves once the newly set baseline is uploaded" "bs-unpushed" \
+  "$(jq -r '[.snapshots[] | select(.baseline==true) | .name] | join(",")' "$BS_IDX")"
+
 echo "== backup destination must be available before any write =="
 HOME="$(new_home home_dest_guard)"
 omarchy-backup init >/dev/null 2>&1
