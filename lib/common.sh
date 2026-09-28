@@ -19,6 +19,11 @@ OB_REMOTE_INDEX_MAX_BYTES=$((256 * 1024))
 OB_REMOTE_INDEX_MAX_ENTRIES=256
 OB_REMOTE_INDEX_TIMEOUT_SECONDS=20
 OB_REMOTE_OPERATION_TIMEOUT_SECONDS=900
+# A failed upload or verification is retried a few times before the push
+# gives up (see ob_remote_push). The delay is overridable for tests.
+OB_REMOTE_PUSH_ATTEMPTS=3
+OB_REMOTE_PUSH_RETRY_DELAY_SECONDS="${OMARCHY_BACKUP_PUSH_RETRY_DELAY:-10}"
+case "$OB_REMOTE_PUSH_RETRY_DELAY_SECONDS" in ''|*[!0-9]*) OB_REMOTE_PUSH_RETRY_DELAY_SECONDS=10 ;; esac
 
 ob_lib_dir() {
   cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd

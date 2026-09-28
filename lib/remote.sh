@@ -228,19 +228,38 @@ ob_remote_push() {
   target="$(ob_remote_snapshot_target "$base" "$name")" \
     || ob_die "Refusing unsafe remote snapshot target for '$name'."
 
-  ob_info "Uploading '$name' to $target/ ..."
-  if ! timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS}s" \
-      rclone copy "$dir" "$target" \
-      --include manifest.json --include checksums.sha256 --include payload.tar.zst; then
-    ob_err "Upload of '$name' failed; it was not added to the remote index."
-    return 1
-  fi
-  ob_info "Upload copied; verifying remote files against the local snapshot ..."
-  if ! timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS}s" \
-      rclone check "$dir" "$target" \
-      --include manifest.json --include checksums.sha256 --include payload.tar.zst; then
-    ob_err "Remote verification of '$name' failed; it was not added to the remote index."
-    return 1
+  # A single file can get lost on the way (observed 2026-09-28 on an rclone
+  # VFS mount: manifest.json never reached the backend, the mount showed a
+  # 0-byte entry). Copy + check is therefore retried; `rclone copy` only
+  # re-transfers files that differ. Only a verified upload is indexed.
+  local attempt verified=false
+  for ((attempt = 1; attempt <= OB_REMOTE_PUSH_ATTEMPTS; attempt++)); do
+    if [ "$attempt" -gt 1 ]; then
+      ob_warn "Retrying upload of '$name' (attempt $attempt of $OB_REMOTE_PUSH_ATTEMPTS) in ${OB_REMOTE_PUSH_RETRY_DELAY_SECONDS}s ..."
+      sleep "$OB_REMOTE_PUSH_RETRY_DELAY_SECONDS"
+    fi
+    ob_info "Uploading '$name' to $target/ ..."
+    if ! timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS}s" \
+        rclone copy "$dir" "$target" \
+        --include manifest.json --include checksums.sha256 --include payload.tar.zst; then
+      ob_err "Upload of '$name' failed."
+      continue
+    fi
+    ob_info "Upload copied; verifying remote files against the local snapshot ..."
+    if ! timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS}s" \
+        rclone check "$dir" "$target" \
+        --include manifest.json --include checksums.sha256 --include payload.tar.zst; then
+      ob_err "Remote verification of '$name' failed."
+      continue
+    fi
+    verified=true
+    break
+  done
+  if [ "$verified" != "true" ]; then
+    # 75 (EX_TEMPFAIL): the local snapshot is fine, only the transfer failed,
+    # so automatic runs let systemd retry later.
+    ob_err "Upload of '$name' could not be verified after $OB_REMOTE_PUSH_ATTEMPTS attempts; it was not added to the remote index."
+    return 75
   fi
 
   # Mark as pushed in local state, then refresh the remote index.
@@ -263,7 +282,7 @@ ob_remote_push_pending() {
   for n in $(printf '%s\n%s\n' "$baseline" "$latest" | awk 'NF && !seen[$0]++'); do
     if [ "$(ob_state_read | jq -r --arg n "$n" '.snapshots[] | select(.name==$n) | .remote_pushed // false')" != "true" ]; then
       ob_info "Uploading pending snapshot '$n' from an earlier run."
-      ob_remote_push "$n" || rc=1
+      ob_remote_push "$n" || rc=$?
     fi
   done
   return "$rc"

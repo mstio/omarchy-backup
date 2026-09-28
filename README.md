@@ -156,6 +156,12 @@ install` after changing either frequency in config.conf.
   attempts in 3 hours). A retry first uploads pending snapshots (latest and
   current baseline) and never creates a duplicate: automatic runs skip
   creating a new snapshot when nothing changed since the latest local one.
+- Every upload (`push`, automatic or manual) is verified with `rclone check`
+  against the local snapshot. A failed copy or verification is retried up to
+  3 times (10 s apart) within the same push -- a single file can get lost on
+  a caching mount. Only a verified upload is added to the remote index; if
+  all attempts fail, `push` exits with 75 and an automatic run is retried by
+  systemd like an unavailable destination.
 - An automatic `doctor --auto` run that comes back DEGRADED sends a desktop
   notification (`notify-send`) in addition to the journal log, since a log
   line nobody reads isn't "visible" to you.

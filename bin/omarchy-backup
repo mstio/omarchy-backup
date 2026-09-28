@@ -167,7 +167,12 @@ ob_cmd_snapshot() {
       ob_warn "No usable remote backup destination is configured; automatic snapshot '$OB_CREATED_SNAPSHOT_NAME' remains local only."
     elif [ "$remote_ok" = "true" ] && ob_remote_ensure_available --check; then
       ob_info "Automatic $status_color snapshot created locally; uploading it to the configured backup destination."
-      ob_remote_push "$OB_CREATED_SNAPSHOT_NAME" || return 1
+      local push_rc=0
+      ob_remote_push "$OB_CREATED_SNAPSHOT_NAME" || push_rc=$?
+      if [ "$push_rc" -eq 75 ]; then
+        ob_warn "Automatic snapshot '$OB_CREATED_SNAPSHOT_NAME' is safe locally; the upload will be retried."
+      fi
+      return "$push_rc"
     else
       ob_warn "Automatic snapshot '$OB_CREATED_SNAPSHOT_NAME' was created locally, but the backup destination is unavailable; the upload will be retried."
       return 75

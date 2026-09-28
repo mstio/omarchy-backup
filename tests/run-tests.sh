@@ -12,6 +12,7 @@ export PATH="$ROOT_DIR/bin:$PATH"
 
 WORK="$(mktemp -d /tmp/omarchy-backup-tests.XXXXXX)"
 export RCLONE_CONFIG="$WORK/rclone.conf"
+export OMARCHY_BACKUP_PUSH_RETRY_DELAY=0
 REMOTE_STORAGE="$WORK/remote-storage"
 mkdir -p "$REMOTE_STORAGE"
 cat > "$RCLONE_CONFIG" <<EOF
@@ -302,8 +303,9 @@ exec "$REAL_RCLONE" "\$@"
 EOF
 chmod +x "$FAKE_BIN/rclone"
 verify_out="$(PATH="$FAKE_BIN:$PATH" omarchy-backup push verify-fail 2>&1)"; verify_rc=$?
-assert_eq "failed rclone check makes push fail" "1" "$verify_rc"
+assert_eq "persistently failed rclone check makes push fail temporarily (75)" "75" "$verify_rc"
 assert_contains "failed rclone check is explained" "$verify_out" "Remote verification"
+assert_contains "failed rclone check is retried before giving up" "$verify_out" "attempt 3 of 3"
 assert_eq "unverified snapshot is not marked pushed" "null" \
   "$(jq -r '.snapshots[] | select(.name=="verify-fail") | .remote_pushed // "null"' "$HOME/.local/share/omarchy-backup/state.json")"
 
@@ -604,6 +606,51 @@ assert_contains "fresh install pushes to an existing destination" "$out" "Upload
 assert_not_contains "fresh install adopts the existing marker" "$out" "Registered backup destination"
 assert_eq "adopted marker id is remembered" "$guard_id" \
   "$(jq -r --arg d "$GUARD_DEST" '.destinations[$d]' "$HOME/.local/share/omarchy-backup/state.json")"
+
+echo "== a transiently failed upload verification is retried within the push =="
+HOME="$(new_home home_push_retry)"
+omarchy-backup init >/dev/null 2>&1
+configure_remote "$HOME" push-retry
+seed_workspace "$HOME"
+omarchy-backup snapshot retry-once >/dev/null 2>&1
+RETRY_BIN="$WORK/retry-once-rclone-bin"
+mkdir -p "$RETRY_BIN"
+cat > "$RETRY_BIN/rclone" <<RETRY
+#!/bin/bash
+if [ "\$1" = "check" ] && [ ! -e "$WORK/retry-once-failed" ]; then
+  touch "$WORK/retry-once-failed"; exit 1
+fi
+exec "$REAL_RCLONE" "\$@"
+RETRY
+chmod +x "$RETRY_BIN/rclone"
+retry_out="$(PATH="$RETRY_BIN:$PATH" omarchy-backup push retry-once 2>&1)"; retry_rc=$?
+assert_file "retry-once rclone stub was actually exercised" "$WORK/retry-once-failed"
+assert_eq "push succeeds after one failed verification" "0" "$retry_rc"
+assert_contains "the retry is logged" "$retry_out" "attempt 2 of 3"
+assert_contains "the retried upload is verified" "$retry_out" "Upload complete and verified"
+assert_eq "retried snapshot is marked pushed" "true" \
+  "$(jq -r '.snapshots[] | select(.name=="retry-once") | .remote_pushed' "$HOME/.local/share/omarchy-backup/state.json")"
+
+echo "== automatic run: unverifiable upload exits 75 and a later run catches up =="
+HOME="$(new_home home_auto_tempfail)"
+omarchy-backup init >/dev/null 2>&1
+configure_remote "$HOME" auto-tempfail
+seed_workspace "$HOME"
+omarchy-backup snapshot tf-base --baseline >/dev/null 2>&1
+omarchy-backup push tf-base >/dev/null 2>&1
+echo "drift = true" >> "$HOME/.config/hypr/looknfeel.lua"
+tf_out="$(PATH="$FAKE_BIN:$PATH" omarchy-backup snapshot tf-yellow --auto 2>&1)"; tf_rc=$?
+assert_eq "automatic run with unverifiable upload exits 75 (systemd retries)" "75" "$tf_rc"
+assert_contains "automatic tempfail explains that the snapshot is safe locally" "$tf_out" "is safe locally"
+assert_file "automatic snapshot stays local" "$HOME/.local/share/omarchy-backup/snapshots/tf-yellow/payload.tar.zst"
+assert_eq "unverified automatic snapshot is not marked pushed" "null" \
+  "$(jq -r '.snapshots[] | select(.name=="tf-yellow") | .remote_pushed // "null"' "$HOME/.local/share/omarchy-backup/state.json")"
+catchup_out="$(omarchy-backup snapshot tf-again --auto 2>&1)"; catchup_rc=$?
+assert_eq "retry run succeeds once the upload verifies" "0" "$catchup_rc"
+assert_contains "retry run uploads the pending snapshot" "$catchup_out" "Uploading pending snapshot 'tf-yellow'"
+assert_not_file "retry run creates no duplicate snapshot" "$HOME/.local/share/omarchy-backup/snapshots/tf-again"
+assert_eq "pending snapshot is marked pushed after the retry" "true" \
+  "$(jq -r '.snapshots[] | select(.name=="tf-yellow") | .remote_pushed' "$HOME/.local/share/omarchy-backup/state.json")"
 
 echo
 echo "== Summary: $PASS passed, $FAIL failed =="
