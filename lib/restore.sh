@@ -86,12 +86,12 @@ ob_restore_run() {
   ob_restore_plugins "$manifest"
 
   echo
-  echo "== 3/8 Own git checkouts (paths.conf: repo) =="
-  ob_restore_repos "$manifest"
+  echo "== 3/8 Scripts, dotfiles, themes, agent config, machine memory =="
+  ob_restore_payload "$dir"
 
   echo
-  echo "== 4/8 Scripts, dotfiles, themes, agent config, machine memory =="
-  ob_restore_payload "$dir"
+  echo "== 4/8 Own git checkouts (paths.conf: repo) =="
+  ob_restore_repos "$manifest" "$dir"
 
   echo
   echo "== 5/8 systemd user units =="
@@ -366,13 +366,49 @@ ob_restore_repo_path_valid() {
   [[ "/$rel/" != *"/../"* && "/$rel/" != *"/./"* ]]
 }
 
+ob_restore_repo_from_archive() {
+  # ob_restore_repo_from_archive <rel> <archive-rel> <snapshot-dir> <remote> <branch> <reason>
+  # Fallback without git access: unpack the snapshot's embedded copy of the
+  # tracked files (uncommitted edits included, no history). The archive is
+  # read from the restored payload, or straight from the snapshot in a dry run.
+  local rel="$1" arc="$2" sdir="$3" remote="$4" branch="$5" reason="$6" target="$HOME/$1"
+  if [ -z "$arc" ] || [[ "$arc" != .local/share/omarchy-backup/repo-sources/*.tar ]] \
+      || ! ob_restore_repo_path_valid "$arc"; then
+    ob_restore_note "Repo ~/$rel: $reason, and the snapshot has no embedded copy -- clone ${remote:-it} manually."
+    return 0
+  fi
+  if [ "$OB_DRY_RUN" = "true" ]; then
+    echo "  [dry-run] $reason -> unpack the snapshot's embedded copy into ~/$rel (no git history)"
+    return 0
+  fi
+  if [ ! -f "$HOME/$arc" ]; then
+    ob_restore_note "Repo ~/$rel: $reason, and the embedded copy ~/$arc is missing -- clone ${remote:-it} manually."
+    return 0
+  fi
+  local stage; stage="$(dirname -- "$target")/.$(basename -- "$target").restore.tmp.$$"
+  rm -rf -- "$stage"; mkdir -p -- "$stage"
+  # GNU tar refuses absolute and `..` member names by default.
+  if ! tar -x -f "$HOME/$arc" -C "$stage" --no-same-owner 2>/dev/null; then
+    rm -rf -- "$stage"
+    ob_restore_note "Repo ~/$rel: $reason, and the embedded copy could not be unpacked -- clone ${remote:-it} manually."
+    return 0
+  fi
+  mv -- "$stage" "$target"
+  echo "  -> ~/$rel restored from the snapshot's embedded copy ($reason)"
+  if [ -n "$remote" ]; then
+    ob_restore_note "Repo ~/$rel came from the snapshot's embedded copy without git history. To reconnect it later: cd ~/$rel && git init -q && git remote add origin $remote && git fetch origin && git reset origin/${branch:-HEAD}"
+  fi
+}
+
 ob_restore_repos() {
   # Re-clones the user's own git checkouts (declared with `repo <path>`).
   # Unlike plugins, these are working repositories: the remote's branch tip
   # wins when it already contains the snapshot's commit (work pushed after
   # the snapshot is kept); otherwise the snapshot commit is checked out
-  # detached. Existing directories are never touched.
-  local manifest="$1" entries
+  # detached. Existing directories are never touched. Without git, without
+  # access to the remote, or with OB_REPOS_FROM_SNAPSHOT=true, the snapshot's
+  # embedded copy is used instead (step 3 restored it with the payload).
+  local manifest="$1" sdir="${2:-}" entries
   entries="$(echo "$manifest" | jq -c '.repos[]? | select(.missing != true)' 2>/dev/null)"
   if [ -z "$entries" ]; then
     echo "  No recorded git checkouts."
@@ -388,15 +424,14 @@ ob_restore_repos() {
     dirty="$(echo "$e" | jq -r '.dirty // false')"
     diff="$(echo "$e" | jq -r '.diff // ""')"
     untracked="$(echo "$e" | jq -r '.untracked // 0')"
+    local arc; arc="$(echo "$e" | jq -r '.source_archive // ""')"
     if ! ob_restore_repo_path_valid "$rel"; then
       ob_restore_note "Snapshot lists a repo with an unsafe path ($(printf '%q' "$rel")); ignored -- review the manifest manually."
       continue
     fi
     target="$HOME/$rel"
-    if ! ob_restore_plugin_remote_valid "$remote"; then
-      ob_restore_note "Repo ~/$rel: recorded remote is missing or not a plain git URL ($(printf '%q' "$remote")); clone it manually."
-      continue
-    fi
+    local remote_ok=true
+    ob_restore_plugin_remote_valid "$remote" || remote_ok=false
     if [ -n "$branch" ] && ! git check-ref-format --branch "$branch" >/dev/null 2>&1; then
       branch=""
     fi
@@ -414,8 +449,20 @@ ob_restore_repos() {
       ob_restore_note "~/$rel exists but is not a git checkout; not touched -- clone $remote there manually."
       continue
     fi
+    if [ "$remote_ok" != true ]; then
+      ob_restore_repo_from_archive "$rel" "$arc" "$sdir" "" "$branch" "no usable git remote recorded"
+      continue
+    fi
+    if [ "${OB_REPOS_FROM_SNAPSHOT:-false}" = "true" ]; then
+      ob_restore_repo_from_archive "$rel" "$arc" "$sdir" "$remote" "$branch" "--repos-from-snapshot"
+      continue
+    fi
+    if ! ob_require_tool git; then
+      ob_restore_repo_from_archive "$rel" "$arc" "$sdir" "$remote" "$branch" "git is not installed"
+      continue
+    fi
     if [ "$OB_DRY_RUN" = "true" ]; then
-      echo "  [dry-run] clone $remote -> ~/$rel (${branch:-default branch}, snapshot commit ${commit:0:12})"
+      echo "  [dry-run] clone $remote -> ~/$rel (${branch:-default branch}, snapshot commit ${commit:0:12}); falls back to the embedded copy if cloning fails"
       continue
     fi
 
@@ -427,8 +474,8 @@ ob_restore_repos() {
         timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS:-900}s" \
         git clone --quiet -- "$remote" "$stage" >/dev/null 2>&1; then
       rm -rf -- "$stage"
-      ob_warn "Step failed: clone $remote"
-      ob_restore_note "Repo ~/$rel: could not clone $remote (private repo? run \`gh auth login && gh auth setup-git\`, then re-run the restore -- finished steps are skipped)."
+      ob_warn "Could not clone $remote (private repo without \`gh auth login && gh auth setup-git\`? no network?)"
+      ob_restore_repo_from_archive "$rel" "$arc" "$sdir" "$remote" "$branch" "cloning failed"
       continue
     fi
     if [ -n "$branch" ] && [ "$(git -C "$stage" symbolic-ref --quiet --short HEAD 2>/dev/null)" != "$branch" ]; then

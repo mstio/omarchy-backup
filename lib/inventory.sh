@@ -102,6 +102,53 @@ ob_inv_plugins() {
     '{enabled:$enabled, disabled:$disabled, git_managed:$git_managed, local_managed:$local_managed}'
 }
 
+# Embedded source copy of each declared repo (tracked files as they are in
+# the working tree, uncommitted edits included, untracked files and .git
+# excluded). Lets a restore work without GitHub access or credentials; the
+# clone stays the preferred path. Written deterministically (sorted, fixed
+# mtime/owner) so an unchanged repo yields a byte-identical archive and no
+# false drift. Lives under the data dir and is picked up by the payload.
+OB_REPO_SOURCES_DIR="$OB_DATA_DIR/repo-sources"
+
+ob_repo_source_file() {  # <path relative to $HOME> -> archive path
+  printf '%s/%s.tar\n' "$OB_REPO_SOURCES_DIR" "$(printf '%s' "$1" | sed 's|/|__|g')"
+}
+
+ob_repo_sources_refresh() {
+  local p rel out tmp keep=()
+  for p in "${OB_REPOS[@]:-}"; do
+    [ -n "$p" ] && [ -d "$p/.git" ] || continue
+    case "$p" in "$HOME"/*) rel="${p#"$HOME"/}" ;; *) continue ;; esac
+    mkdir -p -- "$OB_REPO_SOURCES_DIR" || return 1
+    out="$(ob_repo_source_file "$rel")"
+    keep+=("$out")
+    tmp="$out.tmp.$$"
+    # Only tracked paths that still exist (a deleted-but-tracked file would
+    # make tar fail).
+    if ! git -C "$p" ls-files -z 2>/dev/null \
+        | (cd -- "$p" && while IFS= read -r -d '' f; do
+             { [ -e "$f" ] || [ -L "$f" ]; } && printf '%s\0' "$f"
+           done) \
+        | tar -C "$p" --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+            --no-recursion --null -T - -cf "$tmp" 2>/dev/null; then
+      rm -f -- "$tmp"
+      ob_warn "Could not archive the sources of ~/$rel; a restore will need to clone it."
+      continue
+    fi
+    if cmp -s -- "$tmp" "$out"; then rm -f -- "$tmp"; else mv -f -- "$tmp" "$out"; fi
+    chmod 600 -- "$out" 2>/dev/null || true
+  done
+  # Drop archives of repos that are no longer declared.
+  local f k found
+  for f in "$OB_REPO_SOURCES_DIR"/*.tar; do
+    [ -e "$f" ] || continue
+    found=false
+    for k in "${keep[@]:-}"; do [ "$k" = "$f" ] && found=true && break; done
+    [ "$found" = true ] || rm -f -- "$f"
+  done
+  return 0
+}
+
 ob_inv_repos() {
   # Own git checkouts declared with `repo <path>` in paths.conf/paths.d.
   # Like git-managed plugins: metadata only (remote, branch, commit, tracked
@@ -124,10 +171,13 @@ ob_inv_repos() {
     # Commits the remote does not have (-1: no upstream configured).
     ahead="$(git -C "$p" rev-list --count '@{u}..HEAD' 2>/dev/null || echo -1)"
     untracked="$(git -C "$p" ls-files --others --exclude-standard 2>/dev/null | wc -l)"
+    local src; src="$(ob_repo_source_file "$rel")"
+    if [ -f "$src" ]; then src="${src#"$HOME"/}"; else src=""; fi
     jq -n --arg path "$rel" --arg remote "$remote" --arg branch "$branch" --arg commit "$commit" \
       --argjson dirty "$dirty" --arg diff "$diff" --argjson ahead "$ahead" --argjson untracked "$untracked" \
+      --arg source_archive "$src" \
       '{path:$path, remote:$remote, branch:$branch, commit:$commit, dirty:$dirty, diff:$diff,
-        ahead:$ahead, untracked:$untracked, missing:false}'
+        ahead:$ahead, untracked:$untracked, source_archive:$source_archive, missing:false}'
   done | jq -s .
 }
 

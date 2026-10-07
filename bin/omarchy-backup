@@ -61,7 +61,8 @@ Usage:
   omarchy-backup push <name>
   omarchy-backup remote-list
   omarchy-backup pull <name>
-  omarchy-backup restore <name> [--dry-run] [--from-remote]
+  omarchy-backup restore <name> [--dry-run] [--from-remote] [--repos-from-snapshot]
+  omarchy-backup import <snapshot-folder>
   omarchy-backup doctor [--auto]
   omarchy-backup timers install|status|uninstall
   omarchy-backup config list|get <KEY>|set <KEY> <VALUE>
@@ -202,19 +203,23 @@ main() {
       [ $# -ge 1 ] || ob_die "Usage: omarchy-backup pull <name>"
       ob_ensure_dirs; ob_load_config; ob_remote_pull "$1" ;;
     restore)
-      [ $# -ge 1 ] || ob_die "Usage: omarchy-backup restore <name> [--dry-run] [--from-remote]"
+      [ $# -ge 1 ] || ob_die "Usage: omarchy-backup restore <name> [--dry-run] [--from-remote] [--repos-from-snapshot]"
       local name="$1"; shift
       OB_DRY_RUN=false
       while [ $# -gt 0 ]; do
         case "$1" in
           --dry-run) OB_DRY_RUN=true ;;
           --from-remote) : ;; # ob_restore_run already falls back to remote automatically
+          --repos-from-snapshot) export OB_REPOS_FROM_SNAPSHOT=true ;;
           *) ob_die "Unknown option: $1" ;;
         esac
         shift
       done
       export OB_DRY_RUN
       ob_restore_run "$name" ;;
+    import)
+      [ $# -ge 1 ] || ob_die "Usage: omarchy-backup import <snapshot-folder>"
+      ob_snapshot_import "$1" ;;
     doctor)
       local auto=false
       [ "${1:-}" = "--auto" ] && auto=true

@@ -270,7 +270,29 @@ ob_remote_push() {
   ob_remote_refresh_index || return 1
   ob_remote_enforce_retention || return 1
   ob_remote_push_recovery_notes "$base"
+  ob_remote_push_tool_archive "$base"
   ob_info "Upload complete and verified."
+}
+
+# A copy of this tool next to the snapshots (omarchy-backup-tool.tar.gz), so a
+# fresh machine can get it from the backup destination itself -- no git, no
+# GitHub. Built from the installed program files (never .git or local data).
+# Never fails the push.
+ob_remote_push_tool_archive() {
+  local base="$1" tmp
+  tmp="$(mktemp -d)" || return 0
+  if tar -C "$(dirname -- "$OB_ROOT_DIR")" --exclude=.git --exclude='*.partial*' \
+        --transform "s|^$(basename -- "$OB_ROOT_DIR")|omarchy-backup|" \
+        --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+        -czf "$tmp/omarchy-backup-tool.tar.gz" "$(basename -- "$OB_ROOT_DIR")" 2>/dev/null \
+      && timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS}s" \
+        rclone copyto "$tmp/omarchy-backup-tool.tar.gz" "$base/omarchy-backup-tool.tar.gz" >/dev/null 2>&1; then
+    ob_info "Tool copy uploaded to $base/omarchy-backup-tool.tar.gz."
+  else
+    ob_warn "Could not upload the tool copy to $base/omarchy-backup-tool.tar.gz."
+  fi
+  rm -rf -- "$tmp"
+  return 0
 }
 
 # Optional (OB_CFG_RECOVERY_NOTES): a plain-text/Markdown file copied next to

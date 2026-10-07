@@ -97,6 +97,7 @@ ob_snapshot_create() {
   mkdir -p "$snap_dir" || ob_die "Could not create the snapshot staging directory: $snap_dir"
 
   local OB_SKIPPED_LARGE=() OB_SKIPPED_SECRET=()
+  ob_repo_sources_refresh || ob_warn "Could not refresh the embedded repo sources."
   ob_resolve_included_files
   ob_info "Resolved ${#OB_RESOLVED_FILES[@]} files to include (${#OB_SKIPPED_LARGE[@]} skipped: too large, ${#OB_SKIPPED_SECRET[@]} skipped: looked like secrets)."
 
@@ -250,4 +251,44 @@ ob_snapshot_show() {
   local dir="$OB_SNAPSHOTS_DIR/$name"
   [ -f "$dir/manifest.json" ] || ob_die "No such snapshot: $name"
   jq . "$dir/manifest.json"
+}
+
+# Takes over a snapshot folder obtained without rclone (e.g. downloaded from
+# the backup destination in a browser, or copied from a USB stick) so that
+# `restore` can use it. Verifies the payload checksum first; never replaces
+# an existing snapshot.
+ob_snapshot_import() {
+  local src="${1%/}"
+  ob_ensure_dirs || ob_die "Could not create the backup directories."
+  ob_state_init_if_missing || ob_die "Could not initialize backup state."
+  [ -f "$src/manifest.json" ] && [ -f "$src/payload.tar.zst" ] && [ -f "$src/checksums.sha256" ] \
+    || ob_die "$src is not a snapshot folder (expected manifest.json, payload.tar.zst, checksums.sha256)."
+  local name; name="$(jq -r '.name // ""' "$src/manifest.json" 2>/dev/null)"
+  ob_snapshot_name_valid "$name" || ob_die "manifest.json in $src has no valid snapshot name."
+  local stored actual
+  stored="$(jq -r '.payload.sha256 // ""' "$src/manifest.json")"
+  actual="$(sha256sum -- "$src/payload.tar.zst" | awk '{print $1}')"
+  [ -n "$stored" ] && [ "$stored" = "$actual" ] || ob_die "Payload checksum mismatch in $src -- the download is incomplete or corrupt."
+  local state; state="$(ob_state_read)"
+  if [ -e "$OB_SNAPSHOTS_DIR/$name" ] || echo "$state" | jq -e --arg n "$name" '.snapshots[] | select(.name==$n)' >/dev/null; then
+    ob_die "A snapshot named '$name' already exists locally; nothing imported."
+  fi
+  [ "$(echo "$state" | jq '.snapshots | length')" -lt "$OB_MAX_SNAPSHOTS" ] \
+    || ob_die "All $OB_MAX_SNAPSHOTS local snapshot slots are in use; free one before importing."
+  local stage="$OB_SNAPSHOTS_DIR/.${name}.import.$$"
+  mkdir -p -- "$stage" || ob_die "Could not create $stage"
+  if ! cp -- "$src/manifest.json" "$src/checksums.sha256" "$src/payload.tar.zst" "$stage/" \
+      || ! mv -- "$stage" "$OB_SNAPSHOTS_DIR/$name"; then
+    rm -rf -- "$stage"
+    ob_die "Could not copy the snapshot into $OB_SNAPSHOTS_DIR."
+  fi
+  chmod 600 -- "$OB_SNAPSHOTS_DIR/$name"/* 2>/dev/null || true
+  local entry
+  entry="$(jq -n --arg name "$name" --arg path "$OB_SNAPSHOTS_DIR/$name" \
+    --slurpfile m "$OB_SNAPSHOTS_DIR/$name/manifest.json" \
+    '{name:$name, created_at:$m[0].created_at, path:$path, baseline:false,
+      omarchy_version:$m[0].omarchy_version, size_bytes:($m[0].payload.size_bytes // 0)}')"
+  ob_state_write "$(echo "$state" | jq --argjson e "$entry" '.snapshots += [$e]')" \
+    || ob_die "Snapshot copied, but state.json could not be updated."
+  ob_info "Imported '$name'. Next: omarchy-backup restore $name --dry-run"
 }

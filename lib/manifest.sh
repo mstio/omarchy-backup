@@ -20,6 +20,10 @@ ob_resolve_included_files() {
   while IFS= read -r extra; do
     [ -n "$extra" ] && plugin_includes+=("$extra")
   done < <(ob_local_plugin_dirs)
+  # Embedded repo source copies (see ob_repo_sources_refresh).
+  case "$OB_REPO_SOURCES_DIR" in
+    "$HOME"/*) [ -d "$OB_REPO_SOURCES_DIR" ] && plugin_includes+=("$OB_REPO_SOURCES_DIR") ;;
+  esac
 
   for root in "${OB_INCLUDES[@]}" "${plugin_includes[@]}"; do
     # Support glob patterns in include entries (e.g. .../plugins/*.service)

@@ -725,6 +725,45 @@ e_out="$(HOME="$EVIL" omarchy-backup restore withrepo 2>&1)"
 assert_contains "a repo path escaping HOME is refused" "$e_out" "unsafe path"
 assert_not_file "nothing is cloned outside HOME" "$WORK/escape"
 
+echo "== restore without git access: embedded repo copy =="
+assert_contains "manifest points at the embedded source copy" "$(jq -r '.repos[0].source_archive' "$RSNAP/manifest.json")" "repo-sources/Projects__tool.tar"
+assert_contains "the embedded copy travels in the payload" "$(zstd -q -d -c "$RSNAP/payload.tar.zst" | tar -t)" ".local/share/omarchy-backup/repo-sources/Projects__tool.tar"
+SRCS1="$(sha256sum < "$RSRC/.local/share/omarchy-backup/repo-sources/Projects__tool.tar")"
+HOME="$RSRC" omarchy-backup snapshot unchanged-src >/dev/null 2>&1
+assert_eq "an unchanged repo yields a byte-identical archive (no false drift)" "$SRCS1" \
+  "$(sha256sum < "$RSRC/.local/share/omarchy-backup/repo-sources/Projects__tool.tar")"
+OFFR="$WORK/repo_offline"
+o_out="$(repo_restore_into repo_offline --repos-from-snapshot)"
+assert_file "--repos-from-snapshot restores the tree" "$OFFR/Projects/tool/bin/tool"
+assert_not_file "--repos-from-snapshot needs no clone (no .git)" "$OFFR/Projects/tool/.git"
+assert_contains "the embedded copy includes tracked uncommitted edits" "$(cat "$OFFR/Projects/tool/bin/tool")" "local tweak"
+assert_not_file "untracked files are not in the embedded copy" "$OFFR/Projects/tool/notes.txt"
+assert_eq "restored link works from the embedded copy" "tool-v1" "$(HOME="$OFFR" "$OFFR/.local/bin/tool" 2>/dev/null | head -1 || true)"
+assert_contains "restore explains how to reconnect git later" "$o_out" "git remote add origin $REPO_BARE"
+DEADR="$(new_home repo_deadremote)"; HOME="$DEADR" omarchy-backup init >/dev/null 2>&1
+mkdir -p "$DEADR/.local/share/omarchy-backup/snapshots/withrepo"; cp "$RSNAP"/* "$DEADR/.local/share/omarchy-backup/snapshots/withrepo/"
+jq --arg r "$WORK/does-not-exist.git" '.repos[0].remote=$r' "$RSNAP/manifest.json" > "$DEADR/.local/share/omarchy-backup/snapshots/withrepo/manifest.json"
+d_out="$(HOME="$DEADR" omarchy-backup restore withrepo 2>&1)"
+assert_file "unreachable remote falls back to the embedded copy" "$DEADR/Projects/tool/bin/tool"
+assert_contains "the fallback is reported" "$d_out" "restored from the snapshot's embedded copy (cloning failed)"
+
+echo "== import: a snapshot folder obtained without rclone =="
+DL="$WORK/downloaded/withrepo"; mkdir -p "$DL"; cp "$RSNAP"/* "$DL/"
+IMP="$(new_home repo_import)"; HOME="$IMP" omarchy-backup init >/dev/null 2>&1
+i_out="$(HOME="$IMP" omarchy-backup import "$DL" 2>&1)"
+assert_contains "import names the next step" "$i_out" "omarchy-backup restore withrepo --dry-run"
+assert_eq "imported snapshot is listed in state" "withrepo" "$(jq -r '.snapshots[0].name' "$IMP/.local/share/omarchy-backup/state.json")"
+HOME="$IMP" omarchy-backup restore withrepo --repos-from-snapshot >/dev/null 2>&1
+assert_file "imported snapshot restores" "$IMP/Projects/tool/bin/tool"
+i2_rc=0; HOME="$IMP" omarchy-backup import "$DL" >/dev/null 2>&1 || i2_rc=$?
+assert_eq "importing the same snapshot twice is refused" "1" "$i2_rc"
+BAD="$WORK/downloaded/bad"; mkdir -p "$BAD"; cp "$RSNAP"/* "$BAD/"; jq '.name="badcopy"' "$RSNAP/manifest.json" > "$BAD/manifest.json"
+printf 'x' >> "$BAD/payload.tar.zst"
+IMP2="$(new_home repo_import_bad)"; HOME="$IMP2" omarchy-backup init >/dev/null 2>&1
+b2_out="$(HOME="$IMP2" omarchy-backup import "$BAD" 2>&1)"
+assert_contains "a corrupt download is refused" "$b2_out" "checksum mismatch"
+assert_not_file "nothing is imported from a corrupt download" "$IMP2/.local/share/omarchy-backup/snapshots/badcopy"
+
 echo "== recovery notes are uploaded next to the snapshots =="
 HOME="$(new_home home_recovery_notes)"
 omarchy-backup init >/dev/null 2>&1
@@ -737,6 +776,12 @@ rn_out="$(omarchy-backup push rn-base 2>&1)"
 assert_contains "push reports the uploaded notes" "$rn_out" "Recovery notes uploaded"
 assert_eq "RECOVERY.md lies next to the snapshots" "# How to get back up" \
   "$(cat "$REMOTE_STORAGE/recovery-notes/$(hostname)/RECOVERY.md" 2>/dev/null)"
+TOOLARC="$REMOTE_STORAGE/recovery-notes/$(hostname)/omarchy-backup-tool.tar.gz"
+assert_file "a copy of the tool lies next to the snapshots" "$TOOLARC"
+assert_contains "the tool copy contains the CLI" "$(tar -tzf "$TOOLARC")" "omarchy-backup/bin/omarchy-backup"
+assert_not_contains "the tool copy contains no .git" "$(tar -tzf "$TOOLARC")" "/.git/"
+TX="$WORK/toolx"; mkdir -p "$TX"; tar -xzf "$TOOLARC" -C "$TX"
+assert_contains "the unpacked tool copy runs" "$(HOME="$WORK/toolx-home" "$TX/omarchy-backup/bin/omarchy-backup" help 2>&1)" "omarchy-backup import"
 
 echo
 echo "== Summary: $PASS passed, $FAIL failed =="

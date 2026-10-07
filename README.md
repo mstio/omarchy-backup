@@ -49,8 +49,8 @@ Handled separately, not via `paths.conf`:
   snapshot payload directly.
 - **Your own git checkouts** (`repo <path>` lines in `paths.d/`, e.g. a
   tool that `~/.local/bin` symlinks into): recorded as `{remote, branch,
-  commit, tracked diff}` and re-cloned on restore (step 3) -- the tree itself
-  is never embedded. Snapshots warn about unpushed commits and untracked
+  commit, tracked diff}` and re-cloned on restore (step 4), plus a small
+  embedded copy of the tracked files for restores without git access. Snapshots warn about unpushed commits and untracked
   files, because those cannot come back. `doctor` warns when a
   `~/.local/bin` link points into a checkout that is not declared.
 
@@ -301,6 +301,18 @@ Fresh Omarchy install
   -> omarchy-backup restore <name>
 ```
 
+**Without git or rclone**: every push also leaves a copy of this tool
+(`omarchy-backup-tool.tar.gz`) and your recovery notes (`RECOVERY.md`, see
+`OB_CFG_RECOVERY_NOTES`) next to the snapshots. On a fresh machine you can
+download both plus a snapshot folder from the destination in a browser, then:
+
+```
+tar -xzf omarchy-backup-tool.tar.gz -C ~/Projects && ~/Projects/omarchy-backup/install.sh
+omarchy-backup import ~/Downloads/<snapshot-folder>
+omarchy-backup restore <name> --dry-run --repos-from-snapshot
+omarchy-backup restore <name> --repos-from-snapshot
+```
+
 Note: snapshots are stored per hostname (`<destination>/<hostname>/`), so
 give the fresh install the same hostname (or `hostnamectl set-hostname`)
 before `remote-list`. The destination does not have to be mounted yet: point
@@ -337,15 +349,25 @@ as a manual step at the end rather than failing the whole restore.
    silently falling back to whatever upstream's default branch contains
    today. The manifest's pin is what the snapshot promises; restore keeps
    that promise or says so.
-3. **Own git checkouts** (`repo` lines) -- clones each recorded remote into
+3. **Scripts, dotfiles, themes, agent config, machine memory** -- see below
+   (this step runs before the checkouts so their embedded copies are there).
+4. **Own git checkouts** (`repo` lines) -- clones each recorded remote into
    its old place under `$HOME`. If the remote's branch already contains the
    snapshot commit, its current tip is kept (work pushed after the snapshot
    survives); otherwise the snapshot commit is checked out detached, and a
    commit the remote never received is reported. Tracked uncommitted edits
    are reapplied. An existing directory is never touched. Private repos need
    `gh auth login && gh auth setup-git` first; otherwise the clone is listed
-   as a manual step and the restore can simply be re-run later.
-4. **Scripts, dotfiles, themes, agent config, machine memory** -- the
+   as a manual step and the restore can simply be re-run later. **Without
+   git access** (no GitHub login, no network to the remote, git missing, or
+   `restore --repos-from-snapshot`) the snapshot's embedded copy is unpacked
+   instead: every snapshot carries the tracked files of each declared repo as
+   they were in the working tree (uncommitted edits included, untracked
+   files and history not), under
+   `~/.local/share/omarchy-backup/repo-sources/`. The restore prints the
+   commands to reconnect such a copy to git later.
+
+   Payload details (step 3): the
    payload is extracted to `$HOME`. This one step covers `~/.local/bin`,
    Hyprland/Omarchy config, and the shared agent knowledge base +
    per-project machine memory, including recreating the
