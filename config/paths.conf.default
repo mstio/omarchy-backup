@@ -54,6 +54,13 @@ include ~/.gemini/GEMINI.md
 include ~/.gemini/settings.json
 include ~/.gemini/config
 
+# --- This tool's own configuration ---------------------------------------
+# Without it a restored machine would keep backing up with defaults only
+# (no destination, none of your paths.d additions or repo lines).
+include ~/.config/omarchy-backup/config.conf
+include ~/.config/omarchy-backup/paths.conf
+include ~/.config/omarchy-backup/paths.d
+
 # --- Misc user config -----------------------------------------------------
 include ~/.config/mimeapps.list
 include ~/.config/user-dirs.dirs

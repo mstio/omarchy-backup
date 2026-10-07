@@ -301,6 +301,14 @@ Fresh Omarchy install
   -> omarchy-backup restore <name>
 ```
 
+Note: snapshots are stored per hostname (`<destination>/<hostname>/`), so
+give the fresh install the same hostname (or `hostnamectl set-hostname`)
+before `remote-list`. The destination does not have to be mounted yet: point
+`OB_CFG_REMOTE_NAME`/`OB_CFG_REMOTE_PATH` at the rclone remote for the
+restore; your own `config.conf` and `paths.d/` come back with the payload
+(the temporary one is kept as `config.conf.bak.<timestamp>`), together with
+the units that mount the destination again.
+
 Note: any plugin the manifest lists as git-managed (`plugins.git_managed` --
 this includes not just third-party plugins but your own, once you `git
 init` one) gets reinstalled via `omarchy plugin add <remote-url>` (step 2
