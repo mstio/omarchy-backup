@@ -53,6 +53,13 @@ include ~/.codex/rules
 include ~/.gemini/GEMINI.md
 include ~/.gemini/settings.json
 include ~/.gemini/config
+# Global instruction files of further agent CLIs (plain Markdown, no logins;
+# their other config files can hold API keys and are deliberately left out).
+include ~/.config/opencode/AGENTS.md
+include ~/.copilot/copilot-instructions.md
+include ~/.grok/AGENTS.md
+include ~/.config/crush/CRUSH.md
+include ~/.config/AGENTS.md
 
 # --- This tool's own configuration ---------------------------------------
 # Without it a restored machine would keep backing up with defaults only

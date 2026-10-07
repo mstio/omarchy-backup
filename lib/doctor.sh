@@ -69,26 +69,30 @@ ob_doctor_run() {
     ob_doctor_check "Config paths" "FAIL" "none of the paths in $OB_PATHS_FILE (or paths.d/) exist -- Fix: edit $OB_PATHS_FILE (or add a drop-in under $OB_PATHS_D_DIR) to match where your config actually lives now."
   fi
 
-  # Machine memory readable
-  if compgen -G "$HOME/.claude/projects/*/memory" >/dev/null 2>&1; then
+  # Agent memory: only meaningful where Claude Code is in use (its
+  # per-project memory is the one agent memory this tool's defaults name).
+  # Other agents are not required -- a setup without Claude stays HEALTHY.
+  if [ ! -d "$HOME/.claude/projects" ] || compgen -G "$HOME/.claude/projects/*/memory" >/dev/null 2>&1; then
     ob_doctor_check "Machine memory" "OK"
   else
-    ob_doctor_check "Machine memory" "WARN" "no ~/.claude/projects/*/memory directory found -- Fix: harmless if you simply haven't used Claude Code's memory feature yet; otherwise check whether that path moved."
+    ob_doctor_check "Machine memory" "WARN" "~/.claude/projects exists but has no */memory directory -- Fix: harmless if you don't use Claude Code's memory feature; otherwise check whether that path moved."
   fi
 
-  # Agent configuration + shared symlink structure
-  local sym_ok=true sym_detail=""
-  for pair in "$HOME/.claude/CLAUDE.md" "$HOME/.codex/AGENTS.md" "$HOME/.gemini/GEMINI.md"; do
-    if [ -L "$pair" ]; then
-      [ -e "$pair" ] || { sym_ok=false; sym_detail="$sym_detail broken symlink: $pair;"; }
-    else
-      sym_ok=false; sym_detail="$sym_detail not a symlink (or missing): $pair;"
+  # Agent instruction files: whichever agents are set up, a shared
+  # instruction file that is a symlink must resolve. Missing files or plain
+  # files are fine (not every setup shares one file across agents).
+  local sym_detail="" pair
+  for pair in "$HOME/.claude/CLAUDE.md" "$HOME/.codex/AGENTS.md" "$HOME/.gemini/GEMINI.md" \
+              "$HOME/.config/opencode/AGENTS.md" "$HOME/.copilot/copilot-instructions.md" \
+              "$HOME/.grok/AGENTS.md" "$HOME/.config/AGENTS.md" "$HOME/.config/crush/CRUSH.md"; do
+    if [ -L "$pair" ] && [ ! -e "$pair" ]; then
+      sym_detail="$sym_detail broken symlink: $pair;"
     fi
   done
-  if [ "$sym_ok" = true ]; then
+  if [ -z "$sym_detail" ]; then
     ob_doctor_check "Agent configuration" "OK"
   else
-    ob_doctor_check "Agent configuration" "WARN" "$sym_detail -- Fix: recreate the missing symlink(s), e.g. \`ln -sf ~/.config/ai-agents/AGENTS.md ~/.claude/CLAUDE.md\`."
+    ob_doctor_check "Agent configuration" "WARN" "$sym_detail -- Fix: point the link at your shared instruction file again (e.g. \`ln -sfn <file> <link>\`) or remove it."
   fi
 
   # systemd units/timers we manage

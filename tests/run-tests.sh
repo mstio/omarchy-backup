@@ -764,6 +764,19 @@ b2_out="$(HOME="$IMP2" omarchy-backup import "$BAD" 2>&1)"
 assert_contains "a corrupt download is refused" "$b2_out" "checksum mismatch"
 assert_not_file "nothing is imported from a corrupt download" "$IMP2/.local/share/omarchy-backup/snapshots/badcopy"
 
+echo "== doctor does not require a particular agent vendor =="
+HOME="$(new_home home_other_agents)"
+omarchy-backup init >/dev/null 2>&1
+mkdir -p "$HOME/.config/opencode" "$HOME/shared"
+echo "# rules" > "$HOME/shared/AGENTS.md"
+ln -s "$HOME/shared/AGENTS.md" "$HOME/.config/opencode/AGENTS.md"
+ag_out="$(omarchy-backup doctor 2>&1)"
+assert_contains "no Claude/Codex/Gemini: agent configuration OK" "$ag_out" "$(printf '%-28s %s' 'Agent configuration' 'OK')"
+assert_contains "no Claude: machine memory OK" "$ag_out" "$(printf '%-28s %s' 'Machine memory' 'OK')"
+rm "$HOME/shared/AGENTS.md"
+ag2_out="$(omarchy-backup doctor 2>&1)"
+assert_contains "a broken shared instruction link is flagged" "$ag2_out" "broken symlink: $HOME/.config/opencode/AGENTS.md"
+
 echo "== recovery notes are uploaded next to the snapshots =="
 HOME="$(new_home home_recovery_notes)"
 omarchy-backup init >/dev/null 2>&1
