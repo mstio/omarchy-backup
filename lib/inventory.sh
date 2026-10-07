@@ -102,6 +102,35 @@ ob_inv_plugins() {
     '{enabled:$enabled, disabled:$disabled, git_managed:$git_managed, local_managed:$local_managed}'
 }
 
+ob_inv_repos() {
+  # Own git checkouts declared with `repo <path>` in paths.conf/paths.d.
+  # Like git-managed plugins: metadata only (remote, branch, commit, tracked
+  # diff), never the tree itself. Paths are stored relative to $HOME so a
+  # restore onto a different $HOME lands in the same place.
+  # Returns: [{path, remote, branch, commit, dirty, diff, ahead, untracked, missing}]
+  local p rel remote branch commit dirty diff ahead untracked
+  for p in "${OB_REPOS[@]:-}"; do
+    [ -n "$p" ] || continue
+    case "$p" in "$HOME"/*) rel="${p#"$HOME"/}" ;; *) continue ;; esac
+    if [ ! -d "$p/.git" ]; then
+      jq -n --arg path "$rel" '{path:$path, missing:true}'
+      continue
+    fi
+    remote="$(git -C "$p" remote get-url origin 2>/dev/null || echo "")"
+    branch="$(git -C "$p" symbolic-ref --quiet --short HEAD 2>/dev/null || echo "")"
+    commit="$(git -C "$p" rev-parse HEAD 2>/dev/null || echo "")"
+    diff="$(git -C "$p" diff HEAD 2>/dev/null || true)"
+    if [ -n "$diff" ]; then dirty=true; else dirty=false; fi
+    # Commits the remote does not have (-1: no upstream configured).
+    ahead="$(git -C "$p" rev-list --count '@{u}..HEAD' 2>/dev/null || echo -1)"
+    untracked="$(git -C "$p" ls-files --others --exclude-standard 2>/dev/null | wc -l)"
+    jq -n --arg path "$rel" --arg remote "$remote" --arg branch "$branch" --arg commit "$commit" \
+      --argjson dirty "$dirty" --arg diff "$diff" --argjson ahead "$ahead" --argjson untracked "$untracked" \
+      '{path:$path, remote:$remote, branch:$branch, commit:$commit, dirty:$dirty, diff:$diff,
+        ahead:$ahead, untracked:$untracked, missing:false}'
+  done | jq -s .
+}
+
 ob_inv_systemd_user_units() {
   # Only units that have an actual file in ~/.config/systemd/user (i.e. hand
   # authored / installed by the user, not vendor units enabled via .wants).
@@ -129,12 +158,14 @@ ob_inv_all() {
     --argjson appimages "$(ob_inv_appimages)" \
     --argjson plugins "$(ob_inv_plugins)" \
     --argjson systemd_user_units "$(ob_inv_systemd_user_units)" \
+    --argjson repos "$(ob_inv_repos)" \
     '{
       omarchy_version:$omarchy_version,
       kernel:$kernel,
       hyprland_version:$hyprland_version,
       packages: {pacman_explicit:$pacman_explicit, aur_foreign:$aur_foreign, flatpak:$flatpak, appimages:$appimages},
       plugins:$plugins,
-      systemd_user_units:$systemd_user_units
+      systemd_user_units:$systemd_user_units,
+      repos:$repos
     }'
 }

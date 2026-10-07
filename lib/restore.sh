@@ -78,27 +78,31 @@ ob_restore_run() {
   fi
 
   echo
-  echo "== 1/7 Packages =="
+  echo "== 1/8 Packages =="
   ob_restore_packages "$manifest"
 
   echo
-  echo "== 2/7 Omarchy plugins =="
+  echo "== 2/8 Omarchy plugins =="
   ob_restore_plugins "$manifest"
 
   echo
-  echo "== 3/7 Scripts, dotfiles, themes, agent config, machine memory =="
+  echo "== 3/8 Own git checkouts (paths.conf: repo) =="
+  ob_restore_repos "$manifest"
+
+  echo
+  echo "== 4/8 Scripts, dotfiles, themes, agent config, machine memory =="
   ob_restore_payload "$dir"
 
   echo
-  echo "== 4/7 systemd user units =="
+  echo "== 5/8 systemd user units =="
   ob_restore_systemd "$manifest"
 
   echo
-  echo "== 5/7 Symlink structure =="
+  echo "== 6/8 Symlink structure =="
   echo "  (recreated as part of the payload extraction above; nothing further to do)"
 
   echo
-  echo "== 6/7 Integrity check =="
+  echo "== 7/8 Integrity check =="
   if [ "$OB_DRY_RUN" = "true" ]; then
     echo "  [dry-run] skipped (nothing was written)"
   else
@@ -106,7 +110,7 @@ ob_restore_run() {
   fi
 
   echo
-  echo "== 7/7 Remaining manual steps =="
+  echo "== 8/8 Remaining manual steps =="
   ob_restore_report_manifest_gaps "$manifest"
   if [ "${#OB_MANUAL_STEPS[@]}" -eq 0 ]; then
     echo "  None recorded."
@@ -353,6 +357,110 @@ ob_restore_plugins() {
   fi
 }
 
+ob_restore_repo_path_valid() {
+  # Relative to $HOME, no absolute path, no `..` component, no control chars.
+  local rel="${1:-}"
+  [ -n "$rel" ] && [ "${#rel}" -le 1024 ] || return 1
+  [[ "$rel" != /* && "$rel" != -* ]] || return 1
+  [[ "$rel" != *$'\n'* && "$rel" != *$'\r'* ]] || return 1
+  [[ "/$rel/" != *"/../"* && "/$rel/" != *"/./"* ]]
+}
+
+ob_restore_repos() {
+  # Re-clones the user's own git checkouts (declared with `repo <path>`).
+  # Unlike plugins, these are working repositories: the remote's branch tip
+  # wins when it already contains the snapshot's commit (work pushed after
+  # the snapshot is kept); otherwise the snapshot commit is checked out
+  # detached. Existing directories are never touched.
+  local manifest="$1" entries
+  entries="$(echo "$manifest" | jq -c '.repos[]? | select(.missing != true)' 2>/dev/null)"
+  if [ -z "$entries" ]; then
+    echo "  No recorded git checkouts."
+    return 0
+  fi
+  local e rel remote branch commit dirty diff untracked target stage tip
+  while IFS= read -r e; do
+    [ -z "$e" ] && continue
+    rel="$(echo "$e" | jq -r '.path // ""')"
+    remote="$(echo "$e" | jq -r '.remote // ""')"
+    branch="$(echo "$e" | jq -r '.branch // ""')"
+    commit="$(echo "$e" | jq -r '.commit // ""')"
+    dirty="$(echo "$e" | jq -r '.dirty // false')"
+    diff="$(echo "$e" | jq -r '.diff // ""')"
+    untracked="$(echo "$e" | jq -r '.untracked // 0')"
+    if ! ob_restore_repo_path_valid "$rel"; then
+      ob_restore_note "Snapshot lists a repo with an unsafe path ($(printf '%q' "$rel")); ignored -- review the manifest manually."
+      continue
+    fi
+    target="$HOME/$rel"
+    if ! ob_restore_plugin_remote_valid "$remote"; then
+      ob_restore_note "Repo ~/$rel: recorded remote is missing or not a plain git URL ($(printf '%q' "$remote")); clone it manually."
+      continue
+    fi
+    if [ -n "$branch" ] && ! git check-ref-format --branch "$branch" >/dev/null 2>&1; then
+      branch=""
+    fi
+    [ "$untracked" -gt 0 ] 2>/dev/null \
+      && ob_restore_note "Repo ~/$rel had $untracked untracked file(s) at snapshot time; those were never backed up."
+    if [ -d "$target/.git" ]; then
+      if [ "$(git -C "$target" remote get-url origin 2>/dev/null)" = "$remote" ]; then
+        echo "  ~/$rel already present, leaving as-is."
+      else
+        ob_restore_note "Repo ~/$rel exists with a different origin than recorded ($remote); left untouched."
+      fi
+      continue
+    fi
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      ob_restore_note "~/$rel exists but is not a git checkout; not touched -- clone $remote there manually."
+      continue
+    fi
+    if [ "$OB_DRY_RUN" = "true" ]; then
+      echo "  [dry-run] clone $remote -> ~/$rel (${branch:-default branch}, snapshot commit ${commit:0:12})"
+      continue
+    fi
+
+    echo "  -> clone $remote -> ~/$rel"
+    mkdir -p -- "$(dirname -- "$target")"
+    stage="$(dirname -- "$target")/.$(basename -- "$target").restore.tmp.$$"
+    rm -rf -- "$stage"
+    if ! GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -oBatchMode=yes}" \
+        timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS:-900}s" \
+        git clone --quiet -- "$remote" "$stage" >/dev/null 2>&1; then
+      rm -rf -- "$stage"
+      ob_warn "Step failed: clone $remote"
+      ob_restore_note "Repo ~/$rel: could not clone $remote (private repo? run \`gh auth login && gh auth setup-git\`, then re-run the restore -- finished steps are skipped)."
+      continue
+    fi
+    if [ -n "$branch" ] && [ "$(git -C "$stage" symbolic-ref --quiet --short HEAD 2>/dev/null)" != "$branch" ]; then
+      git -C "$stage" checkout --quiet "$branch" 2>/dev/null \
+        || ob_restore_note "Repo ~/$rel: branch '$branch' not found at $remote; left on the default branch."
+    fi
+    if ob_restore_plugin_commit_valid "$commit" && git -C "$stage" cat-file -e "${commit}^{commit}" 2>/dev/null; then
+      tip="$(git -C "$stage" rev-parse HEAD 2>/dev/null)"
+      if [ "$tip" != "$commit" ] && ! git -C "$stage" merge-base --is-ancestor "$commit" HEAD 2>/dev/null; then
+        git -C "$stage" -c advice.detachedHead=false checkout --quiet --detach "$commit"
+        ob_restore_note "Repo ~/$rel: snapshot commit ${commit:0:12} is not on ${branch:-the default branch} at $remote; checked out detached -- review."
+      elif [ "$tip" != "$commit" ]; then
+        echo "  ~/$rel: remote is newer than the snapshot (${commit:0:12} -> ${tip:0:12}); keeping the remote state."
+      fi
+    else
+      ob_restore_note "Repo ~/$rel: snapshot commit ${commit:0:12} is not at $remote (it was never pushed); checkout is at the remote's current state."
+    fi
+    mv -- "$stage" "$target"
+    if [ "$dirty" = "true" ] && [ -n "$diff" ]; then
+      if echo "$diff" | git -C "$target" apply --check - 2>/dev/null; then
+        echo "$diff" | git -C "$target" apply -
+        echo "  Reapplied uncommitted changes to ~/$rel."
+      else
+        local diff_file="$OB_DATA_DIR/restore-repo-$(echo "$rel" | tr '/' '_').diff"
+        echo "$diff" > "$diff_file"
+        ob_restore_note "Repo ~/$rel had uncommitted changes that no longer apply cleanly; saved to $diff_file."
+      fi
+    fi
+    echo "  -> ~/$rel restored at $(git -C "$target" rev-parse --short HEAD 2>/dev/null)"
+  done <<< "$entries"
+}
+
 ob_restore_payload() {
   local dir="$1"
   local tmp; tmp="$(mktemp -d)"
@@ -390,7 +498,7 @@ ob_restore_systemd() {
   if [ "$OB_DRY_RUN" != "true" ]; then
     systemctl --user daemon-reload 2>/dev/null || true
   fi
-  echo "$units" | while IFS= read -r u; do
+  while IFS= read -r u; do
     local name enabled active
     name="$(echo "$u" | jq -r .name)"
     enabled="$(echo "$u" | jq -r .enabled)"
@@ -401,7 +509,7 @@ ob_restore_systemd() {
     if [ "$active" = "active" ]; then
       ob_restore_run_step "start $name" systemctl --user start "$name"
     fi
-  done
+  done <<< "$units"
 }
 
 ob_restore_verify() {

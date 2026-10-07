@@ -269,7 +269,29 @@ ob_remote_push() {
 
   ob_remote_refresh_index || return 1
   ob_remote_enforce_retention || return 1
+  ob_remote_push_recovery_notes "$base"
   ob_info "Upload complete and verified."
+}
+
+# Optional (OB_CFG_RECOVERY_NOTES): a plain-text/Markdown file copied next to
+# the snapshots as RECOVERY.md on every push, so the "how do I get back up"
+# notes are readable from the backup destination itself -- before anything is
+# installed on a fresh machine. Never fails the push.
+ob_remote_push_recovery_notes() {
+  local base="$1" src="${OB_CFG_RECOVERY_NOTES:-}"
+  [ -n "$src" ] || return 0
+  src="$(ob_expand_path "$src")"
+  if [ ! -f "$src" ] || [ ! -r "$src" ]; then
+    ob_warn "Recovery notes $src not found; not uploaded."
+    return 0
+  fi
+  if timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS}s" \
+      rclone copyto "$src" "$base/RECOVERY.md" >/dev/null 2>&1; then
+    ob_info "Recovery notes uploaded to $base/RECOVERY.md."
+  else
+    ob_warn "Could not upload recovery notes to $base/RECOVERY.md."
+  fi
+  return 0
 }
 
 # Uploads what an earlier automatic run could not: the latest local snapshot

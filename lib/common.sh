@@ -121,6 +121,11 @@ OB_CFG_MAX_FILE_SIZE_MB=20
 # If true, automatic (timer-driven) snapshots are skipped when `status`
 # reports GREEN (no drift since the baseline).
 OB_CFG_SKIP_AUTO_IF_CLEAN=true
+
+# Optional: a Markdown/text file with your own recovery notes (where the
+# repos are, which logins to redo, ...). Copied to <destination>/<hostname>/
+# RECOVERY.md on every push, so it is readable before anything is installed.
+OB_CFG_RECOVERY_NOTES=
 EOF
   ob_info "Wrote default config: $OB_CONFIG_FILE"
 }
@@ -157,6 +162,7 @@ ob_expand_path() {
 ob_read_path_rules() {
   OB_INCLUDES=()
   OB_EXCLUDES=()
+  OB_REPOS=()
   local f line kind val
   while IFS= read -r f; do
     [ -z "$f" ] && continue
@@ -171,6 +177,9 @@ ob_read_path_rules() {
       case "$kind" in
         include) OB_INCLUDES+=("$val") ;;
         exclude) OB_EXCLUDES+=("$val") ;;
+        # Own git checkouts (e.g. a tool that ~/.local/bin symlinks into):
+        # recorded as remote + commit, re-cloned on restore, never embedded.
+        repo) OB_REPOS+=("${val%/}") ;;
       esac
     done < "$f"
   done < <(ob_paths_files)

@@ -14,6 +14,7 @@ declare -A OB_CFG_VALIDATORS=(
   [OB_CFG_RETENTION_REMOTE]=ob_cfg_validate_posint
   [OB_CFG_MAX_FILE_SIZE_MB]=ob_cfg_validate_posint
   [OB_CFG_SKIP_AUTO_IF_CLEAN]=ob_cfg_validate_bool
+  [OB_CFG_RECOVERY_NOTES]=ob_cfg_validate_anything
 )
 
 ob_cfg_validate_bool() { case "$1" in true|false) return 0 ;; *) return 1 ;; esac; }

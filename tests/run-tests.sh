@@ -652,6 +652,92 @@ assert_not_file "retry run creates no duplicate snapshot" "$HOME/.local/share/om
 assert_eq "pending snapshot is marked pushed after the retry" "true" \
   "$(jq -r '.snapshots[] | select(.name=="tf-yellow") | .remote_pushed' "$HOME/.local/share/omarchy-backup/state.json")"
 
+echo "== own git checkouts (paths.conf: repo) come back on restore =="
+G="git -c user.name=t -c user.email=t@t"
+REPO_BARE="$WORK/tool-upstream.git"
+git init -q --bare -b main "$REPO_BARE"
+RSRC="$(new_home repo_src_home)"
+HOME="$RSRC" omarchy-backup init >/dev/null 2>&1
+git clone -q "$REPO_BARE" "$RSRC/Projects/tool" 2>/dev/null
+mkdir -p "$RSRC/Projects/tool/bin" "$RSRC/.local/bin"
+printf '#!/bin/bash\necho tool-v1\n' > "$RSRC/Projects/tool/bin/tool"; chmod +x "$RSRC/Projects/tool/bin/tool"
+$G -C "$RSRC/Projects/tool" add -A; $G -C "$RSRC/Projects/tool" commit -q -m v1; git -C "$RSRC/Projects/tool" push -q origin main 2>/dev/null
+ln -s "$RSRC/Projects/tool/bin/tool" "$RSRC/.local/bin/tool"
+# Undeclared first: doctor must point at the checkout behind the link.
+doc_out="$(HOME="$RSRC" omarchy-backup doctor 2>&1)"
+assert_contains "doctor flags a ~/.local/bin link into an undeclared checkout" "$doc_out" "which is not declared"
+echo "repo ~/Projects/tool" > "$RSRC/.config/omarchy-backup/paths.d/repos.conf"
+doc_out="$(HOME="$RSRC" omarchy-backup doctor 2>&1)"
+assert_contains "doctor accepts the declared checkout" "$doc_out" "$(printf '%-28s %s' 'Own git checkouts' 'OK')"
+# Tracked uncommitted edit + an unpushed commit-free state; plus an untracked file.
+echo "local tweak" >> "$RSRC/Projects/tool/bin/tool"
+echo "scratch" > "$RSRC/Projects/tool/notes.txt"
+snap_out="$(HOME="$RSRC" omarchy-backup snapshot withrepo 2>&1)"
+RSNAP="$RSRC/.local/share/omarchy-backup/snapshots/withrepo"
+assert_eq "manifest records the repo path relative to HOME" "Projects/tool" "$(jq -r '.repos[0].path' "$RSNAP/manifest.json")"
+assert_eq "manifest records the repo remote" "$REPO_BARE" "$(jq -r '.repos[0].remote' "$RSNAP/manifest.json")"
+assert_eq "manifest records the tracked diff" "true" "$(jq -r '.repos[0].dirty' "$RSNAP/manifest.json")"
+assert_contains "snapshot warns about untracked files in the repo" "$snap_out" "untracked file(s) are not part of the backup"
+assert_not_contains "the repo tree itself is not embedded" "$(zstd -q -d -c "$RSNAP/payload.tar.zst" | tar -t)" "Projects/tool"
+$G -C "$RSRC/Projects/tool" commit -q -am "local only"
+assert_contains "symlinks inside included directories are snapshotted" "$(cat "$RSNAP/checksums.sha256")" "symlink:$RSRC/Projects/tool/bin/tool  .local/bin/tool"
+snap2_out="$(HOME="$RSRC" omarchy-backup snapshot withrepo2 2>&1)"
+assert_contains "snapshot warns about unpushed commits" "$snap2_out" "unpushed commit(s)"
+
+repo_restore_into() {
+  local h; h="$(new_home "$1")"
+  HOME="$h" omarchy-backup init >/dev/null 2>&1
+  mkdir -p "$h/.local/share/omarchy-backup/snapshots/withrepo"
+  cp "$RSNAP"/* "$h/.local/share/omarchy-backup/snapshots/withrepo/"
+  shift
+  HOME="$h" omarchy-backup restore withrepo "$@" 2>&1
+}
+DRYR="$WORK/repo_dry"
+dry_out="$(repo_restore_into repo_dry --dry-run)"
+assert_contains "dry run announces the clone" "$dry_out" "[dry-run] clone $REPO_BARE"
+assert_not_file "dry run does not clone" "$DRYR/Projects/tool"
+FRESHR="$WORK/repo_fresh"
+r_out="$(repo_restore_into repo_fresh)"
+assert_file "restore re-clones the declared checkout" "$FRESHR/Projects/tool/.git"
+assert_eq "restored ~/.local/bin link works again" "tool-v1" "$(HOME="$FRESHR" "$FRESHR/.local/bin/tool" | head -1)"
+assert_contains "tracked uncommitted edit is reapplied" "$(cat "$FRESHR/Projects/tool/bin/tool")" "local tweak"
+assert_contains "untracked files are reported as not backed up" "$r_out" "untracked file(s) at snapshot time"
+# Remote moved on after the snapshot: the newer pushed state wins.
+$G -C "$WORK/repo_fresh/Projects/tool" stash -q 2>/dev/null
+OTHER="$WORK/tool-other"; git clone -q "$REPO_BARE" "$OTHER" 2>/dev/null
+echo "v2" > "$OTHER/CHANGES"; $G -C "$OTHER" add -A; $G -C "$OTHER" commit -q -m v2; git -C "$OTHER" push -q origin main 2>/dev/null
+NEWR="$WORK/repo_newer"
+n_out="$(repo_restore_into repo_newer)"
+assert_eq "restore keeps the newer remote state" "$(git -C "$OTHER" rev-parse HEAD)" "$(git -C "$NEWR/Projects/tool" rev-parse HEAD)"
+assert_contains "restore says the remote is newer" "$n_out" "remote is newer than the snapshot"
+# An existing non-git directory is never touched.
+BLOCK="$(new_home repo_blocked)"; mkdir -p "$BLOCK/Projects/tool"; echo keep > "$BLOCK/Projects/tool/file"
+HOME="$BLOCK" omarchy-backup init >/dev/null 2>&1
+mkdir -p "$BLOCK/.local/share/omarchy-backup/snapshots/withrepo"; cp "$RSNAP"/* "$BLOCK/.local/share/omarchy-backup/snapshots/withrepo/"
+b_out="$(HOME="$BLOCK" omarchy-backup restore withrepo 2>&1)"
+assert_eq "existing non-git directory is left untouched" "keep" "$(cat "$BLOCK/Projects/tool/file")"
+assert_contains "the skipped repo is listed as a manual step" "$b_out" "is not a git checkout; not touched"
+# Hostile manifest path is refused.
+EVIL="$(new_home repo_evil)"; HOME="$EVIL" omarchy-backup init >/dev/null 2>&1
+mkdir -p "$EVIL/.local/share/omarchy-backup/snapshots/withrepo"; cp "$RSNAP"/* "$EVIL/.local/share/omarchy-backup/snapshots/withrepo/"
+jq '.repos[0].path="../escape"' "$RSNAP/manifest.json" > "$EVIL/.local/share/omarchy-backup/snapshots/withrepo/manifest.json"
+e_out="$(HOME="$EVIL" omarchy-backup restore withrepo 2>&1)"
+assert_contains "a repo path escaping HOME is refused" "$e_out" "unsafe path"
+assert_not_file "nothing is cloned outside HOME" "$WORK/escape"
+
+echo "== recovery notes are uploaded next to the snapshots =="
+HOME="$(new_home home_recovery_notes)"
+omarchy-backup init >/dev/null 2>&1
+configure_remote "$HOME" recovery-notes
+seed_workspace "$HOME"
+echo "# How to get back up" > "$HOME/notes.md"
+omarchy-backup config set OB_CFG_RECOVERY_NOTES "~/notes.md" >/dev/null 2>&1
+omarchy-backup snapshot rn-base --baseline >/dev/null 2>&1
+rn_out="$(omarchy-backup push rn-base 2>&1)"
+assert_contains "push reports the uploaded notes" "$rn_out" "Recovery notes uploaded"
+assert_eq "RECOVERY.md lies next to the snapshots" "# How to get back up" \
+  "$(cat "$REMOTE_STORAGE/recovery-notes/$(hostname)/RECOVERY.md" 2>/dev/null)"
+
 echo
 echo "== Summary: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]

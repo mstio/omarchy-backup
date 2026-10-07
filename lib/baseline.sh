@@ -220,6 +220,7 @@ ob_unchanged_since_snapshot() {
   rm -f -- "$live"
   local filter='{p: ((.packages.pacman_explicit + .packages.aur_foreign) | sort),
                  e: (.plugins.enabled | sort),
-                 g: ([.plugins.git_managed[] | {id, commit, dirty}] | sort_by(.id))}'
+                 g: ([.plugins.git_managed[] | {id, commit, dirty}] | sort_by(.id)),
+                 r: ([.repos[]? | {path, commit, diff}] | sort_by(.path))}'
   [ "$(ob_inv_all | jq -cS "$filter")" = "$(jq -cS "$filter" "$dir/manifest.json")" ]
 }

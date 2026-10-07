@@ -28,7 +28,11 @@ ob_resolve_included_files() {
       if [ -d "$expanded" ] && [ ! -L "$expanded" ]; then
         while IFS= read -r -d '' f; do
           ob_resolve_consider_file "$f" "$max_bytes"
-        done < <(find "$expanded" -type f -print0 2>/dev/null)
+        # Symlinks inside included directories are part of the setup too
+        # (e.g. ~/.local/bin/<tool> -> a git checkout); recorded as links,
+        # never followed. Before 2026-10-07 only regular files were picked
+        # up here, so such links silently vanished on restore.
+        done < <(find "$expanded" \( -type f -o -type l \) -print0 2>/dev/null)
       elif [ -f "$expanded" ] || [ -L "$expanded" ]; then
         ob_resolve_consider_file "$expanded" "$max_bytes"
       fi

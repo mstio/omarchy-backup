@@ -150,6 +150,41 @@ ob_doctor_run() {
     fi
   fi
 
+  # Own git checkouts: declared ones must be re-clonable, and nothing in
+  # ~/.local/bin may point into a checkout a restore would not bring back
+  # (the symlink would come back, its target would not).
+  local repo_problem="" r top l target
+  for r in "${OB_REPOS[@]:-}"; do
+    [ -n "$r" ] || continue
+    if [ ! -d "$r/.git" ]; then
+      repo_problem="$repo_problem $r(not a git checkout);"
+    elif [ -z "$(git -C "$r" remote get-url origin 2>/dev/null)" ]; then
+      repo_problem="$repo_problem $r(no origin remote);"
+    fi
+  done
+  local -A undeclared=()
+  for l in "$HOME/.local/bin"/*; do
+    [ -L "$l" ] || continue
+    target="$(readlink -f -- "$l" 2>/dev/null)" || continue
+    [ -e "$target" ] || continue
+    case "$target" in "$HOME/.config/omarchy/plugins/"*) continue ;; esac
+    top="$(git -C "$(dirname -- "$target")" rev-parse --show-toplevel 2>/dev/null)" || continue
+    [ -n "$top" ] || continue
+    local declared=false
+    for r in "${OB_REPOS[@]:-}"; do
+      [ "$(readlink -f -- "$r" 2>/dev/null)" = "$top" ] && declared=true && break
+    done
+    [ "$declared" = true ] || undeclared["$top"]=1
+  done
+  for top in "${!undeclared[@]}"; do
+    repo_problem="$repo_problem ~/.local/bin links into $top, which is not declared;"
+  done
+  if [ -z "$repo_problem" ]; then
+    ob_doctor_check "Own git checkouts" "OK"
+  else
+    ob_doctor_check "Own git checkouts" "WARN" "$repo_problem -- Fix: add \`repo <path>\` for each checkout to a drop-in under $OB_PATHS_D_DIR (needs an origin remote), so a restore re-clones it."
+  fi
+
   # Restore plausibility: the commands restore.sh relies on still exist
   local restore_tools_missing=""
   for t in pacman git systemctl; do

@@ -33,7 +33,9 @@ clobber your changes). Ships with: Hyprland/Omarchy shell config, dock/theme
 config, `~/.local/bin`, `~/.config/ai-agents` (the shared
 Codex/Claude/Gemini knowledge base), each agent's small config files and
 `~/.claude/projects/*/memory`, `mimeapps.list`/`user-dirs.dirs`, and your own
-`~/.config/systemd/user/*.{service,timer,path}` unit files.
+`~/.config/systemd/user/*.{service,timer,path}` unit files. Symlinks inside
+included directories (e.g. `~/.local/bin/<tool>` pointing into a git
+checkout) are recorded as links, never followed.
 
 Handled separately, not via `paths.conf`:
 
@@ -45,6 +47,17 @@ Handled separately, not via `paths.conf`:
   that commit (see restore step 2) -- not copied file-by-file. A plugin with
   **no** `.git` (i.e. your own, hand-written plugin) is embedded in the
   snapshot payload directly.
+- **Your own git checkouts** (`repo <path>` lines in `paths.d/`, e.g. a
+  tool that `~/.local/bin` symlinks into): recorded as `{remote, branch,
+  commit, tracked diff}` and re-cloned on restore (step 3) -- the tree itself
+  is never embedded. Snapshots warn about unpushed commits and untracked
+  files, because those cannot come back. `doctor` warns when a
+  `~/.local/bin` link points into a checkout that is not declared.
+
+  ```
+  # ~/.config/omarchy-backup/paths.d/local-repos.conf
+  repo ~/Projects/my-tool
+  ```
 - **AppImages**: only detected and listed (path + checksum) for you to
   re-fetch; not embedded (they're large, redistributable binaries).
 
@@ -170,6 +183,12 @@ Check timer status: `omarchy-backup timers status` (wraps `systemctl --user
 list-timers`). Remove them: `omarchy-backup timers uninstall`.
 
 ## Remote backup
+
+Optional recovery notes: set `OB_CFG_RECOVERY_NOTES` to a Markdown/text file
+(e.g. `omarchy-backup config set OB_CFG_RECOVERY_NOTES ~/notes/recovery.md`)
+and every push copies it to `<destination>/<hostname>/RECOVERY.md` -- your
+"how to get back up" notes (repo URLs, logins to redo) are then readable
+straight from the backup destination before anything is installed.
 
 Storage-agnostic via `rclone` -- two ways to point it somewhere, both driven
 by `OB_CFG_REMOTE_PATH`:
@@ -310,20 +329,28 @@ as a manual step at the end rather than failing the whole restore.
    silently falling back to whatever upstream's default branch contains
    today. The manifest's pin is what the snapshot promises; restore keeps
    that promise or says so.
-3. **Scripts, dotfiles, themes, agent config, machine memory** -- the
+3. **Own git checkouts** (`repo` lines) -- clones each recorded remote into
+   its old place under `$HOME`. If the remote's branch already contains the
+   snapshot commit, its current tip is kept (work pushed after the snapshot
+   survives); otherwise the snapshot commit is checked out detached, and a
+   commit the remote never received is reported. Tracked uncommitted edits
+   are reapplied. An existing directory is never touched. Private repos need
+   `gh auth login && gh auth setup-git` first; otherwise the clone is listed
+   as a manual step and the restore can simply be re-run later.
+4. **Scripts, dotfiles, themes, agent config, machine memory** -- the
    payload is extracted to `$HOME`. This one step covers `~/.local/bin`,
    Hyprland/Omarchy config, and the shared agent knowledge base +
    per-project machine memory, including recreating the
    `~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md` / `~/.gemini/GEMINI.md`
    symlink triplet as symlinks (not copies).
-4. **systemd user units** -- copies your unit files back, `daemon-reload`,
+5. **systemd user units** -- copies your unit files back, `daemon-reload`,
    then enables/starts exactly the units that were enabled/active in the
    snapshot.
-5. **Symlink structure** -- a side effect of step 3 (tar preserves symlinks
+6. **Symlink structure** -- a side effect of step 4 (tar preserves symlinks
    as symlinks).
-6. **Integrity check** -- every restored file's checksum is re-verified
+7. **Integrity check** -- every restored file's checksum is re-verified
    against `checksums.sha256`.
-7. **Manual steps** -- printed at the end: anything skipped as too
+8. **Manual steps** -- printed at the end: anything skipped as too
    large/secret at snapshot time, AppImages to re-fetch, Flatpak apps to
    reinstall, any step that failed automatically, and the standing note
    that secrets/logins are never restored automatically.
@@ -421,7 +448,8 @@ Omarchy's directory layout, plugin system, or package tooling can change over
 time and quietly break backup or restore. `doctor` checks: Omarchy version
 detected, expected directories present, plugin detection working, package
 inventory working, configured paths resolving to something, machine memory
-readable, the agent symlink triplet intact, this tool's own systemd units
+readable, the agent symlink triplet intact, declared own git checkouts
+re-clonable (and no `~/.local/bin` link into an undeclared one), this tool's own systemd units
 well-formed, the remote reachable, a snapshot still creatable, the latest local
 manifest well-formed, its checksum valid, and the commands `restore` depends on
 (`pacman`, `git`, `systemctl`, `omarchy`) still present.
@@ -436,6 +464,7 @@ Machine memory               OK
 Agent configuration          OK
 systemd units                OK
 Remote backup                OK
+Own git checkouts            OK
 Snapshot capability           OK
 Snapshot manifest            OK
 Checksum validity             OK

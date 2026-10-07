@@ -132,6 +132,19 @@ ob_snapshot_create() {
     rm -rf -- "$snap_dir"
     ob_die "Could not collect a valid system inventory. The previous snapshots were left untouched."
   fi
+  # Own git checkouts come back from their remote on restore -- anything not
+  # pushed is at risk, so say so at snapshot time (tracked edits do travel
+  # as a diff in the manifest; untracked files and unpushed commits don't).
+  local repo_warn
+  while IFS= read -r repo_warn; do
+    [ -n "$repo_warn" ] && ob_warn "$repo_warn"
+  done < <(echo "$inventory" | jq -r '.repos[]? |
+    if .missing then "Declared repo ~/\(.path) does not exist (paths.conf: repo)."
+    elif .remote == "" then "Repo ~/\(.path) has no origin remote; a restore cannot re-clone it."
+    elif .ahead < 0 then "Repo ~/\(.path) has no upstream branch; unpushed commits would be lost on restore."
+    elif .ahead > 0 then "Repo ~/\(.path) has \(.ahead) unpushed commit(s); a restore only gets what the remote has."
+    else empty end,
+    (select((.untracked // 0) > 0) | "Repo ~/\(.path): \(.untracked) untracked file(s) are not part of the backup.")')
   local payload_sha payload_size
   if ! payload_sha="$(sha256sum -- "$payload" | awk '{print $1}')" || [ -z "$payload_sha" ]; then
     rm -rf -- "$snap_dir"
@@ -171,6 +184,7 @@ ob_snapshot_create() {
       packages: $inventory.packages,
       plugins: $inventory.plugins,
       systemd_user_units: $inventory.systemd_user_units,
+      repos: ($inventory.repos // []),
       skipped_large_files:$skipped_large,
       skipped_secret_files:$skipped_secret,
       payload: {file:$payload_file, sha256:$payload_sha256, size_bytes:$payload_size},
