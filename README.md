@@ -32,7 +32,9 @@ local additions instead of editing it, so a future default update doesn't
 clobber your changes). Ships with: Hyprland/Omarchy shell config, dock/theme
 config, `~/.local/bin`, `~/.config/ai-agents` (the shared
 Codex/Claude/Gemini knowledge base), each agent's small config files and
-`~/.claude/projects/*/memory`, `mimeapps.list`/`user-dirs.dirs`, and your own
+`~/.claude/projects/*/memory`, `mimeapps.list`/`user-dirs.dirs`, app launchers
+(`~/.local/share/applications`, incl. Omarchy web apps and TUIs, plus
+`~/.local/share/icons`), the mise tool list (`~/.config/mise/config.toml`), and your own
 `~/.config/systemd/user/*.{service,timer,path}` unit files. Symlinks inside
 included directories (e.g. `~/.local/bin/<tool>` pointing into a git
 checkout) are recorded as links, never followed.
@@ -396,6 +398,8 @@ to itself (the convention already used elsewhere on this machine).
 - SSH/GPG keys, browser profiles/passwords, and anything else outside
   `paths.conf`'s declared scope.
 - AppImages and Flatpak apps are only listed, not reinstalled for you.
+- Tools pinned via mise (agent CLIs, `gh`, `node`) are restored as the list in
+  `~/.config/mise/config.toml`; restore names `mise install` as a manual step.
 - A plugin's uncommitted local patch that no longer applies cleanly against
   a newer upstream commit (rare, but the diff is saved for manual review).
 - Cloning a git-managed plugin from a **private** repo (including one of

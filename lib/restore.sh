@@ -88,6 +88,10 @@ ob_restore_run() {
   echo
   echo "== 3/8 Scripts, dotfiles, themes, agent config, machine memory =="
   ob_restore_payload "$dir"
+  # Tools pinned via mise (agent CLIs, gh, node) are listed, not embedded.
+  if tar --zstd -tf "$dir/payload.tar.zst" 2>/dev/null | grep -qE '^(\./)?\.config/mise/config\.toml$'; then
+    ob_restore_note "Install the tools pinned in ~/.config/mise/config.toml: mise install"
+  fi
 
   echo
   echo "== 4/8 Own git checkouts (paths.conf: repo) =="

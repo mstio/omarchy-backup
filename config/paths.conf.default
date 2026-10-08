@@ -39,6 +39,16 @@ include ~/.config/omarchy/lock-designs
 # --- User-authored scripts/tools ----------------------------------------
 include ~/.local/bin
 
+# --- Installed apps outside the package lists ---------------------------
+# Omarchy web apps, TUIs and other launchers live as .desktop files; their
+# icons are resolved by name, partly from ~/.local/share/icons. Tools pinned
+# via mise (agent CLIs, gh, node) come back with `mise install` after restore.
+include ~/.local/share/applications
+include ~/.local/share/icons
+exclude mimeinfo.cache
+exclude *.desktop.bak*
+include ~/.config/mise/config.toml
+
 # --- Shared cross-agent knowledge / machine memory ----------------------
 include ~/.config/ai-agents
 include ~/.claude/CLAUDE.md

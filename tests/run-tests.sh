@@ -799,5 +799,26 @@ TX="$WORK/toolx"; mkdir -p "$TX"; tar -xzf "$TOOLARC" -C "$TX"
 assert_contains "the unpacked tool copy runs" "$(HOME="$WORK/toolx-home" "$TX/omarchy-backup/bin/omarchy-backup" help 2>&1)" "omarchy-backup import"
 
 echo
+echo "== app launchers and mise tools are captured; restore names mise install =="
+APPS_HOME="$(new_home home_apps)"
+HOME="$APPS_HOME" omarchy-backup init >/dev/null 2>&1
+mkdir -p "$APPS_HOME/.local/share/applications" "$APPS_HOME/.config/mise"
+printf '[Desktop Entry]\nName=Mail\nExec=true\n' > "$APPS_HOME/.local/share/applications/Mail.desktop"
+printf 'old\n' > "$APPS_HOME/.local/share/applications/Mail.desktop.bak.1"
+printf 'x\n' > "$APPS_HOME/.local/share/applications/mimeinfo.cache"
+printf '[tools]\ngh = "latest"\n' > "$APPS_HOME/.config/mise/config.toml"
+HOME="$APPS_HOME" omarchy-backup snapshot --baseline apps >/dev/null 2>&1
+apps_list="$(tar --zstd -tf "$APPS_HOME/.local/share/omarchy-backup/snapshots/apps/payload.tar.zst" 2>/dev/null)"
+assert_contains "launcher is in the payload" "$apps_list" ".local/share/applications/Mail.desktop"
+assert_contains "mise config is in the payload" "$apps_list" ".config/mise/config.toml"
+assert_not_contains "launcher backups are excluded" "$apps_list" "Mail.desktop.bak.1"
+assert_not_contains "mimeinfo.cache is excluded" "$apps_list" "mimeinfo.cache"
+APPS_FRESH="$(new_home home_apps_fresh)"
+HOME="$APPS_FRESH" omarchy-backup init >/dev/null 2>&1
+mkdir -p "$APPS_FRESH/.local/share/omarchy-backup/snapshots"
+cp -r "$APPS_HOME/.local/share/omarchy-backup/snapshots/apps" "$APPS_FRESH/.local/share/omarchy-backup/snapshots/apps"
+apps_out="$(HOME="$APPS_FRESH" PATH="$STUB_BIN:$PATH" omarchy-backup restore apps --dry-run 2>&1)"
+assert_contains "restore names mise install" "$apps_out" "mise install"
+
 echo "== Summary: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]
