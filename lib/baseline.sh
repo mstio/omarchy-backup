@@ -183,6 +183,10 @@ ob_status() {
     [ -n "$removed_pkgs" ] && echo "$removed_pkgs" | sed 's/^/  package: /'
     [ -n "$removed_plugins" ] && echo "$removed_plugins" | sed 's/^/  plugin: /'
   fi
+  # YELLOW is a valid state, not an error. Without this return the function
+  # inherited the status of the last `[ -n ... ] &&` (1 when no plugins were
+  # removed), and the bar widget showed ERROR.
+  return 0
 }
 
 ob_status_color_only() {

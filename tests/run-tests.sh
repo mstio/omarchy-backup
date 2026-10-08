@@ -123,7 +123,9 @@ echo "== 4. status: YELLOW after drift (changed/added/removed) =="
 echo "gaps_in = 999" > "$HOME/.config/hypr/looknfeel.lua"
 echo "extra = true" > "$HOME/.config/hypr/extra.lua"
 rm "$HOME/.local/bin/mytool"
-status_out="$(omarchy-backup status 2>&1)"
+status_rc=0
+status_out="$(omarchy-backup status 2>&1)" || status_rc=$?
+assert_eq "status YELLOW exits 0 (removed files, no removed plugins)" "0" "$status_rc"
 assert_contains "status YELLOW" "$status_out" "Status: YELLOW"
 assert_contains "drift shows changed hypr" "$status_out" "~/.config/hypr/"
 assert_contains "drift shows removed local bin" "$status_out" "~/.local/bin/"
