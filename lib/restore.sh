@@ -404,14 +404,150 @@ ob_restore_repo_from_archive() {
   fi
 }
 
+ob_restore_repo_from_bundle() {
+  # ob_restore_repo_from_bundle <rel> <bundle-rel> <snapshot-dir> <remote> <branch> <commit> <dirty> <diff> <reason>
+  # Rebuilds the checkout from the snapshot's history bundle: every branch,
+  # tag and remote-tracking ref as it was, origin set to the recorded remote
+  # (if any), the recorded branch/commit checked out and tracked uncommitted
+  # edits reapplied. Returns 1 (caller falls back to the file-only copy) if
+  # there is no usable bundle.
+  local rel="$1" bun="$2" sdir="$3" remote="$4" branch="$5" commit="$6" dirty="$7" diff="$8" reason="$9"
+  local target="$HOME/$rel" src stage
+  [ -n "$bun" ] && [[ "$bun" == .local/share/omarchy-backup/repo-sources/*.bundle ]] \
+    && ob_restore_repo_path_valid "$bun" || return 1
+  ob_require_tool git || return 1
+  if [ "$OB_DRY_RUN" = "true" ]; then
+    # Step 3 did not write the payload; the bundle is still inside it.
+    if [ -n "$sdir" ] && [ -z "${OB_RESTORE_PAYLOAD_LIST+x}" ]; then
+      OB_RESTORE_PAYLOAD_LIST="$(zstd -q -d -c "$sdir/payload.tar.zst" 2>/dev/null | tar -t 2>/dev/null)"
+    fi
+    if printf '%s\n' "${OB_RESTORE_PAYLOAD_LIST:-}" | grep -qxF -- "$bun"; then
+      echo "  [dry-run] $reason -> rebuild ~/$rel from the snapshot's history bundle (all branches and tags)"
+      return 0
+    fi
+    return 1
+  fi
+  src="$HOME/$bun"
+  [ -f "$src" ] || return 1
+  stage="$(dirname -- "$target")/.$(basename -- "$target").restore.tmp.$$"
+  rm -rf -- "$stage"; mkdir -p -- "$(dirname -- "$target")"
+  if ! git init -q -- "$stage" >/dev/null 2>&1 \
+      || ! git -C "$stage" bundle verify -q -- "$src" >/dev/null 2>&1 \
+      || ! ob_restore_fetch_bundle "$stage" "$src" "$rel" --update-head-ok 'refs/*:refs/*'; then
+    rm -rf -- "$stage"
+    ob_restore_note "Repo ~/$rel: the snapshot's history bundle could not be read; falling back to the file-only copy."
+    return 1
+  fi
+  if [ -n "$remote" ] && ob_restore_plugin_remote_valid "$remote"; then
+    git -C "$stage" remote add origin "$remote" 2>/dev/null
+  fi
+  if [ -n "$branch" ] && git -C "$stage" show-ref --verify --quiet "refs/heads/$branch"; then
+    git -C "$stage" checkout -q -f "$branch" 2>/dev/null
+    git -C "$stage" show-ref --verify --quiet "refs/remotes/origin/$branch" \
+      && git -C "$stage" branch -q --set-upstream-to="origin/$branch" "$branch" >/dev/null 2>&1
+  fi
+  if ob_restore_plugin_commit_valid "$commit" && git -C "$stage" cat-file -e "${commit}^{commit}" 2>/dev/null \
+      && [ "$(git -C "$stage" rev-parse HEAD 2>/dev/null)" != "$commit" ]; then
+    git -C "$stage" -c advice.detachedHead=false checkout -q -f --detach "$commit"
+    ob_restore_note "Repo ~/$rel: snapshot commit ${commit:0:12} was not on a branch; checked out detached -- review."
+  fi
+  if ! git -C "$stage" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+    rm -rf -- "$stage"
+    ob_restore_note "Repo ~/$rel: the snapshot's history bundle has no usable checkout; falling back to the file-only copy."
+    return 1
+  fi
+  # The fetch may have pointed the unborn branch at a commit without
+  # populating index and working tree.
+  git -C "$stage" reset -q --hard HEAD >/dev/null 2>&1
+  mv -- "$stage" "$target"
+  if [ "$dirty" = "true" ] && [ -n "$diff" ]; then
+    if echo "$diff" | git -C "$target" apply --check - 2>/dev/null; then
+      echo "$diff" | git -C "$target" apply -
+      echo "  Reapplied uncommitted changes to ~/$rel."
+    else
+      local diff_file="$OB_DATA_DIR/restore-repo-$(echo "$rel" | tr '/' '_').diff"
+      echo "$diff" > "$diff_file"
+      ob_restore_note "Repo ~/$rel had uncommitted changes that no longer apply cleanly; saved to $diff_file."
+    fi
+  fi
+  echo "  -> ~/$rel restored from the snapshot's history bundle ($reason) at $(git -C "$target" rev-parse --short HEAD 2>/dev/null)"
+  [ -n "$remote" ] || echo "     (no remote was recorded; history and tags are complete, consider adding one)"
+  return 0
+}
+
+ob_restore_fetch_bundle() {
+  # ob_restore_fetch_bundle <stage> <bundle> <rel> <fetch option> <refspec...>
+  # With object checks first; a history git fsck objects to (bad dates or
+  # e-mails from old tools, common in old forks) is still imported, with a
+  # note, instead of being dropped.
+  local stage="$1" src="$2" rel="$3" opt="$4"; shift 4
+  git -C "$stage" -c transfer.fsckObjects=true fetch -q "$opt" -- "$src" "$@" >/dev/null 2>&1 && return 0
+  if git -C "$stage" fetch -q "$opt" -- "$src" "$@" >/dev/null 2>&1; then
+    ob_restore_note "Repo ~/$rel: the history bundle contains objects \`git fsck\` rejects; imported without that check -- run \`git fsck\` there."
+    return 0
+  fi
+  return 1
+}
+
+ob_restore_merge_bundle() {
+  # ob_restore_merge_bundle <stage> <bundle-rel> <rel>
+  # After a successful clone: add what only the snapshot's history bundle
+  # has -- commits, local branches and tags the remote never received.
+  # Never moves a ref the remote already has further than the snapshot;
+  # the checked-out branch itself is handled by the caller.
+  local stage="$1" bun="$2" rel="$3" src cur r name snap
+  [ -n "$bun" ] && [[ "$bun" == .local/share/omarchy-backup/repo-sources/*.bundle ]] \
+    && ob_restore_repo_path_valid "$bun" || return 0
+  src="$HOME/$bun"
+  [ -f "$src" ] || return 0
+  git -C "$stage" bundle verify -q -- "$src" >/dev/null 2>&1 || {
+    ob_restore_note "Repo ~/$rel: the snapshot's history bundle could not be read; unpushed work from it was not merged."
+    return 0
+  }
+  # Non-forced: an existing tag with different content is kept (rejected).
+  # (A rejected tag makes fetch fail although everything else arrived.)
+  ob_restore_fetch_bundle "$stage" "$src" "$rel" --no-tags \
+    'refs/heads/*:refs/ob-snapshot/heads/*' 'refs/tags/*:refs/tags/*' || true
+  cur="$(git -C "$stage" symbolic-ref --quiet --short HEAD 2>/dev/null)"
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    name="${r#refs/ob-snapshot/heads/}"
+    [ "$name" = "$cur" ] && continue
+    git -C "$stage" show-ref --verify --quiet "refs/heads/$name" && continue
+    snap="$(git -C "$stage" rev-parse "$r")"
+    if git -C "$stage" show-ref --verify --quiet "refs/remotes/origin/$name" \
+        && git -C "$stage" merge-base --is-ancestor "$snap" "refs/remotes/origin/$name" 2>/dev/null; then
+      continue  # the remote already has all of it
+    fi
+    git -C "$stage" branch -q -- "$name" "$snap" 2>/dev/null || continue
+    if git -C "$stage" show-ref --verify --quiet "refs/remotes/origin/$name"; then
+      git -C "$stage" branch -q --set-upstream-to="origin/$name" "$name" >/dev/null 2>&1
+      ob_restore_note "Repo ~/$rel: branch '$name' restored from the snapshot; it has commits origin/$name lacks -- review and push."
+    else
+      echo "  ~/$rel: restored unpublished branch '$name' from the snapshot's history bundle."
+    fi
+  done < <(git -C "$stage" for-each-ref --format='%(refname)' refs/ob-snapshot/heads/)
+  git -C "$stage" for-each-ref --format='delete %(refname)' refs/ob-snapshot/ | git -C "$stage" update-ref --stdin 2>/dev/null
+  return 0
+}
+
+# Snapshot fallback chain: history bundle first (needs git), then the
+# file-only copy of the tracked files.
+ob_restore_repo_from_snapshot() {
+  # <rel> <archive-rel> <bundle-rel> <snapshot-dir> <remote> <branch> <commit> <dirty> <diff> <reason>
+  ob_restore_repo_from_bundle "$1" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" && return 0
+  ob_restore_repo_from_archive "$1" "$2" "$4" "$5" "$6" "${10}"
+}
+
 ob_restore_repos() {
   # Re-clones the user's own git checkouts (declared with `repo <path>`).
   # Unlike plugins, these are working repositories: the remote's branch tip
   # wins when it already contains the snapshot's commit (work pushed after
   # the snapshot is kept); otherwise the snapshot commit is checked out
-  # detached. Existing directories are never touched. Without git, without
-  # access to the remote, or with OB_REPOS_FROM_SNAPSHOT=true, the snapshot's
-  # embedded copy is used instead (step 3 restored it with the payload).
+  # detached. Existing directories are never touched. Without access to the
+  # remote, or with OB_REPOS_FROM_SNAPSHOT=true, the snapshot's history
+  # bundle is used instead, or (no bundle / no git) its file-only copy;
+  # step 3 restored both with the payload.
   local manifest="$1" sdir="${2:-}" entries
   entries="$(echo "$manifest" | jq -c '.repos[]? | select(.missing != true)' 2>/dev/null)"
   if [ -z "$entries" ]; then
@@ -429,6 +565,7 @@ ob_restore_repos() {
     diff="$(echo "$e" | jq -r '.diff // ""')"
     untracked="$(echo "$e" | jq -r '.untracked // 0')"
     local arc; arc="$(echo "$e" | jq -r '.source_archive // ""')"
+    local bun; bun="$(echo "$e" | jq -r '.history_bundle // ""')"
     if ! ob_restore_repo_path_valid "$rel"; then
       ob_restore_note "Snapshot lists a repo with an unsafe path ($(printf '%q' "$rel")); ignored -- review the manifest manually."
       continue
@@ -454,19 +591,19 @@ ob_restore_repos() {
       continue
     fi
     if [ "$remote_ok" != true ]; then
-      ob_restore_repo_from_archive "$rel" "$arc" "$sdir" "" "$branch" "no usable git remote recorded"
+      ob_restore_repo_from_snapshot "$rel" "$arc" "$bun" "$sdir" "" "$branch" "$commit" "$dirty" "$diff" "no usable git remote recorded"
       continue
     fi
     if [ "${OB_REPOS_FROM_SNAPSHOT:-false}" = "true" ]; then
-      ob_restore_repo_from_archive "$rel" "$arc" "$sdir" "$remote" "$branch" "--repos-from-snapshot"
+      ob_restore_repo_from_snapshot "$rel" "$arc" "$bun" "$sdir" "$remote" "$branch" "$commit" "$dirty" "$diff" "--repos-from-snapshot"
       continue
     fi
     if ! ob_require_tool git; then
-      ob_restore_repo_from_archive "$rel" "$arc" "$sdir" "$remote" "$branch" "git is not installed"
+      ob_restore_repo_from_snapshot "$rel" "$arc" "$bun" "$sdir" "$remote" "$branch" "$commit" "$dirty" "$diff" "git is not installed"
       continue
     fi
     if [ "$OB_DRY_RUN" = "true" ]; then
-      echo "  [dry-run] clone $remote -> ~/$rel (${branch:-default branch}, snapshot commit ${commit:0:12}); falls back to the embedded copy if cloning fails"
+      echo "  [dry-run] clone $remote -> ~/$rel (${branch:-default branch}, snapshot commit ${commit:0:12}); falls back to the snapshot's history bundle / embedded copy if cloning fails"
       continue
     fi
 
@@ -479,16 +616,30 @@ ob_restore_repos() {
         git clone --quiet -- "$remote" "$stage" >/dev/null 2>&1; then
       rm -rf -- "$stage"
       ob_warn "Could not clone $remote (private repo without \`gh auth login && gh auth setup-git\`? no network?)"
-      ob_restore_repo_from_archive "$rel" "$arc" "$sdir" "$remote" "$branch" "cloning failed"
+      ob_restore_repo_from_snapshot "$rel" "$arc" "$bun" "$sdir" "$remote" "$branch" "$commit" "$dirty" "$diff" "cloning failed"
       continue
     fi
     if [ -n "$branch" ] && [ "$(git -C "$stage" symbolic-ref --quiet --short HEAD 2>/dev/null)" != "$branch" ]; then
-      git -C "$stage" checkout --quiet "$branch" 2>/dev/null \
-        || ob_restore_note "Repo ~/$rel: branch '$branch' not found at $remote; left on the default branch."
+      git -C "$stage" checkout --quiet "$branch" 2>/dev/null || true
+    fi
+    ob_restore_merge_bundle "$stage" "$bun" "$rel"
+    # The recorded branch may exist only now (unpublished, from the bundle).
+    if [ -n "$branch" ] && [ "$(git -C "$stage" symbolic-ref --quiet --short HEAD 2>/dev/null)" != "$branch" ]; then
+      if git -C "$stage" show-ref --verify --quiet "refs/heads/$branch"; then
+        git -C "$stage" checkout -q "$branch" 2>/dev/null
+      else
+        ob_restore_note "Repo ~/$rel: branch '$branch' not found at $remote; left on the default branch."
+      fi
     fi
     if ob_restore_plugin_commit_valid "$commit" && git -C "$stage" cat-file -e "${commit}^{commit}" 2>/dev/null; then
       tip="$(git -C "$stage" rev-parse HEAD 2>/dev/null)"
-      if [ "$tip" != "$commit" ] && ! git -C "$stage" merge-base --is-ancestor "$commit" HEAD 2>/dev/null; then
+      if [ "$tip" != "$commit" ] && [ -n "$branch" ] \
+          && [ "$(git -C "$stage" symbolic-ref --quiet --short HEAD 2>/dev/null)" = "$branch" ] \
+          && git -C "$stage" merge-base --is-ancestor HEAD "$commit" 2>/dev/null; then
+        # Commits the remote never got, brought back by the history bundle.
+        git -C "$stage" merge --quiet --ff-only "$commit" >/dev/null 2>&1
+        echo "  ~/$rel: restored $(git -C "$stage" rev-list --count "$tip..$commit" 2>/dev/null) unpushed commit(s) on $branch from the snapshot's history bundle."
+      elif [ "$tip" != "$commit" ] && ! git -C "$stage" merge-base --is-ancestor "$commit" HEAD 2>/dev/null; then
         git -C "$stage" -c advice.detachedHead=false checkout --quiet --detach "$commit"
         ob_restore_note "Repo ~/$rel: snapshot commit ${commit:0:12} is not on ${branch:-the default branch} at $remote; checked out detached -- review."
       elif [ "$tip" != "$commit" ]; then

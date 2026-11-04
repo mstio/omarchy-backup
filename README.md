@@ -51,15 +51,36 @@ Handled separately, not via `paths.conf`:
   snapshot payload directly.
 - **Your own git checkouts** (`repo <path>` lines in `paths.d/`, e.g. a
   tool that `~/.local/bin` symlinks into): recorded as `{remote, branch,
-  commit, tracked diff}` and re-cloned on restore (step 4), plus a small
-  embedded copy of the tracked files for restores without git access. Snapshots warn about unpushed commits and untracked
-  files, because those cannot come back. `doctor` warns when a
-  `~/.local/bin` link points into a checkout that is not declared.
+  commit, tracked diff}` and re-cloned on restore (step 4). Every snapshot
+  also carries an embedded copy of the tracked files and the **full
+  history** as a `git bundle` (all branches, tags and remote-tracking refs),
+  so a repo **without any remote**, or with commits the remote never got,
+  comes back complete. Untracked files are not included; snapshots warn
+  about them. A glob declares every git checkout it matches, so new
+  projects need no extra line (non-git folders are skipped):
 
   ```
   # ~/.config/omarchy-backup/paths.d/local-repos.conf
   repo ~/Projects/my-tool
+  repo ~/Work/*
   ```
+
+  The bundle holds the **whole** history, including anything ever
+  committed and later deleted (a password, a key) and `git stash` entries,
+  and it travels to your remote destination with every snapshot. If that is
+  not wanted, add `exclude *.bundle` (all repos) or
+  `exclude Projects__my-tool.bundle` (one repo) to a drop-in; such repos
+  then come back from their remote, or as files only.
+
+  Note that `exclude .git` in the default `paths.conf` applies to
+  `include` lines: `include ~/Work` alone backs up the files of the repos
+  in there, but not their history. Combine it with `repo ~/Work/*`.
+  (History bundles, `repo` globs and the doctor check below go back to a
+  suggestion from an omarchy-backup user, November 2026.)
+  `doctor` warns about git repos whose history no backup covers (no remote
+  or unpushed commits, not declared with `repo`), in the included folders
+  and in `OB_CFG_REPO_SCAN_ROOTS` (default `~/Projects ~/Work`), and when a
+  `~/.local/bin` link points into a checkout that is not declared.
 - **AppImages**: only detected and listed (path + checksum) for you to
   re-fetch; not embedded (they're large, redistributable binaries).
 
@@ -358,16 +379,21 @@ as a manual step at the end rather than failing the whole restore.
    snapshot commit, its current tip is kept (work pushed after the snapshot
    survives); otherwise the snapshot commit is checked out detached, and a
    commit the remote never received is reported. Tracked uncommitted edits
-   are reapplied. An existing directory is never touched. Private repos need
+   are reapplied; commits, branches and tags the remote never received are
+   added from the snapshot's history bundle (a branch tip the remote moved
+   past is never moved back). An existing directory is never touched. Private repos need
    `gh auth login && gh auth setup-git` first; otherwise the clone is listed
    as a manual step and the restore can simply be re-run later. **Without
-   git access** (no GitHub login, no network to the remote, git missing, or
-   `restore --repos-from-snapshot`) the snapshot's embedded copy is unpacked
-   instead: every snapshot carries the tracked files of each declared repo as
-   they were in the working tree (uncommitted edits included, untracked
-   files and history not), under
-   `~/.local/share/omarchy-backup/repo-sources/`. The restore prints the
-   commands to reconnect such a copy to git later.
+   a usable remote** (none recorded, no GitHub login, no network, or
+   `restore --repos-from-snapshot`) the repo is rebuilt from the snapshot's
+   history bundle: all branches and tags, `origin` set to the recorded
+   remote if there was one, the recorded branch checked out and tracked
+   uncommitted edits reapplied. Only if there is no bundle (older
+   snapshots, a repo larger than `OB_CFG_MAX_FILE_SIZE_MB`) or git is
+   missing, the file-only copy is unpacked instead (tracked files with
+   uncommitted edits, no history); the restore then prints the commands to
+   reconnect it to git later. Both live under
+   `~/.local/share/omarchy-backup/repo-sources/`.
 
    Payload details (step 3): the
    payload is extracted to `$HOME`. This one step covers `~/.local/bin`,
@@ -483,7 +509,10 @@ time and quietly break backup or restore. `doctor` checks: Omarchy version
 detected, expected directories present, plugin detection working, package
 inventory working, configured paths resolving to something, machine memory
 readable, the agent symlink triplet intact, declared own git checkouts
-re-clonable (and no `~/.local/bin` link into an undeclared one), this tool's own systemd units
+present (and no `~/.local/bin` link into an undeclared one), no git history
+outside the backup (repos without remote or with unpushed commits that are
+not declared with `repo`; searched a few levels deep in the included folders
+and `OB_CFG_REPO_SCAN_ROOTS`, never across filesystems), this tool's own systemd units
 well-formed, the remote reachable, a snapshot still creatable, the latest local
 manifest well-formed, its checksum valid, and the commands `restore` depends on
 (`pacman`, `git`, `systemctl`, `omarchy`) still present.
@@ -499,6 +528,7 @@ Agent configuration          OK
 systemd units                OK
 Remote backup                OK
 Own git checkouts            OK
+Unprotected git history      OK
 Snapshot capability           OK
 Snapshot manifest            OK
 Checksum validity             OK

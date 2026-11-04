@@ -114,8 +114,45 @@ ob_repo_source_file() {  # <path relative to $HOME> -> archive path
   printf '%s/%s.tar\n' "$OB_REPO_SOURCES_DIR" "$(printf '%s' "$1" | sed 's|/|__|g')"
 }
 
+ob_repo_bundle_file() {  # <path relative to $HOME> -> history bundle path
+  printf '%s/%s.bundle\n' "$OB_REPO_SOURCES_DIR" "$(printf '%s' "$1" | sed 's|/|__|g')"
+}
+
+# Suggested by an omarchy-backup user (2026-11): repos without a remote lost
+# their history on restore. Full history of a declared repo (all branches, tags, remote-tracking refs)
+# as a `git bundle`, next to the source archive. Without it a repo that has
+# no remote -- or commits the remote never got -- would come back without
+# its history. Rewritten only when a ref moved (a sidecar `.refs` file holds
+# the ref list), because `git bundle` output is not guaranteed to be
+# byte-identical and an unchanged repo must not show up as drift.
+ob_repo_bundle_refresh() {  # <repo path> <path relative to $HOME>
+  local p="$1" out refs tmp
+  out="$(ob_repo_bundle_file "$2")"
+  refs="$(git -C "$p" for-each-ref --format='%(objectname) %(refname)' 2>/dev/null)" || return 1
+  if [ -z "$refs" ]; then  # no commits yet: nothing to bundle
+    rm -f -- "$out" "$out.refs"
+    return 0
+  fi
+  # HEAD too: commits on a detached HEAD move no ref.
+  refs="$refs
+$(git -C "$p" rev-parse -q --verify HEAD 2>/dev/null) HEAD"
+  if [ -f "$out" ] && [ -f "$out.refs" ] && [ "$(cat -- "$out.refs")" = "$refs" ]; then
+    return 0
+  fi
+  tmp="$out.tmp.$$"
+  if ! git -C "$p" bundle create --quiet "$tmp" --all >/dev/null 2>&1; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  mv -f -- "$tmp" "$out"
+  printf '%s\n' "$refs" > "$out.refs"
+  chmod 600 -- "$out" "$out.refs" 2>/dev/null || true
+}
+
 ob_repo_sources_refresh() {
   local p rel out tmp keep=()
+  # Leftovers of an interrupted run would otherwise land in every payload.
+  [ -d "$OB_REPO_SOURCES_DIR" ] && find "${OB_REPO_SOURCES_DIR:?}" -maxdepth 1 -type f \( -name '*.tar.tmp.[0-9]*' -o -name '*.bundle.tmp.[0-9]*' \) -delete 2>/dev/null
   for p in "${OB_REPOS[@]:-}"; do
     [ -n "$p" ] && [ -d "$p/.git" ] || continue
     case "$p" in "$HOME"/*) rel="${p#"$HOME"/}" ;; *) continue ;; esac
@@ -138,9 +175,17 @@ ob_repo_sources_refresh() {
     if cmp -s -- "$tmp" "$out"; then rm -f -- "$tmp"; else mv -f -- "$tmp" "$out"; fi
     chmod 600 -- "$out" 2>/dev/null || true
   done
-  # Drop archives of repos that are no longer declared.
+  for p in "${OB_REPOS[@]:-}"; do
+    [ -n "$p" ] && [ -d "$p/.git" ] || continue
+    case "$p" in "$HOME"/*) rel="${p#"$HOME"/}" ;; *) continue ;; esac
+    out="$(ob_repo_bundle_file "$rel")"
+    keep+=("$out" "$out.refs")
+    ob_repo_bundle_refresh "$p" "$rel" \
+      || ob_warn "Could not bundle the git history of ~/$rel; a restore without its remote gets the files only."
+  done
+  # Drop archives and bundles of repos that are no longer declared.
   local f k found
-  for f in "$OB_REPO_SOURCES_DIR"/*.tar; do
+  for f in "$OB_REPO_SOURCES_DIR"/*.tar "$OB_REPO_SOURCES_DIR"/*.bundle "$OB_REPO_SOURCES_DIR"/*.bundle.refs; do
     [ -e "$f" ] || continue
     found=false
     for k in "${keep[@]:-}"; do [ "$k" = "$f" ] && found=true && break; done
@@ -149,9 +194,18 @@ ob_repo_sources_refresh() {
   return 0
 }
 
+ob_repo_source_in_payload() {  # <file>
+  local f="$1"
+  [ -f "$f" ] || return 1
+  [ "$(stat -c %s -- "$f" 2>/dev/null || echo 0)" -le $(( OB_CFG_MAX_FILE_SIZE_MB * 1024 * 1024 )) ] || return 1
+  ob_matches_any_glob "$f" "${OB_EXCLUDES[@]:-}" && return 1
+  ob_matches_any_glob "$f" "${OB_SECRET_GLOBS[@]}" && return 1
+  return 0
+}
+
 ob_inv_repos() {
   # Own git checkouts declared with `repo <path>` in paths.conf/paths.d.
-  # Like git-managed plugins: metadata only (remote, branch, commit, tracked
+  # Like git-managed plugins: metadata (remote, branch, commit, tracked
   # diff), never the tree itself. Paths are stored relative to $HOME so a
   # restore onto a different $HOME lands in the same place.
   # Returns: [{path, remote, branch, commit, dirty, diff, ahead, untracked, missing}]
@@ -171,13 +225,19 @@ ob_inv_repos() {
     # Commits the remote does not have (-1: no upstream configured).
     ahead="$(git -C "$p" rev-list --count '@{u}..HEAD' 2>/dev/null || echo -1)"
     untracked="$(git -C "$p" ls-files --others --exclude-standard 2>/dev/null | wc -l)"
+    # Only advertised if the file really makes it into the payload (same
+    # size/exclude/secret rules as ob_resolve_consider_file); `exclude
+    # *.bundle` is the documented way to keep history out of snapshots.
     local src; src="$(ob_repo_source_file "$rel")"
-    if [ -f "$src" ]; then src="${src#"$HOME"/}"; else src=""; fi
+    if ob_repo_source_in_payload "$src"; then src="${src#"$HOME"/}"; else src=""; fi
+    local bun; bun="$(ob_repo_bundle_file "$rel")"
+    if ob_repo_source_in_payload "$bun"; then bun="${bun#"$HOME"/}"; else bun=""; fi
     jq -n --arg path "$rel" --arg remote "$remote" --arg branch "$branch" --arg commit "$commit" \
       --argjson dirty "$dirty" --arg diff "$diff" --argjson ahead "$ahead" --argjson untracked "$untracked" \
-      --arg source_archive "$src" \
+      --arg source_archive "$src" --arg history_bundle "$bun" \
       '{path:$path, remote:$remote, branch:$branch, commit:$commit, dirty:$dirty, diff:$diff,
-        ahead:$ahead, untracked:$untracked, source_archive:$source_archive, missing:false}'
+        ahead:$ahead, untracked:$untracked, source_archive:$source_archive,
+        history_bundle:$history_bundle, missing:false}'
   done | jq -s .
 }
 

@@ -684,7 +684,7 @@ assert_not_contains "the repo tree itself is not embedded" "$(zstd -q -d -c "$RS
 $G -C "$RSRC/Projects/tool" commit -q -am "local only"
 assert_contains "symlinks inside included directories are snapshotted" "$(cat "$RSNAP/checksums.sha256")" "symlink:$RSRC/Projects/tool/bin/tool  .local/bin/tool"
 snap2_out="$(HOME="$RSRC" omarchy-backup snapshot withrepo2 2>&1)"
-assert_contains "snapshot warns about unpushed commits" "$snap2_out" "unpushed commit(s)"
+assert_not_contains "unpushed commits need no warning: the history bundle carries them" "$snap2_out" "unpushed commit(s)"
 
 repo_restore_into() {
   local h; h="$(new_home "$1")"
@@ -737,17 +737,166 @@ assert_eq "an unchanged repo yields a byte-identical archive (no false drift)" "
 OFFR="$WORK/repo_offline"
 o_out="$(repo_restore_into repo_offline --repos-from-snapshot)"
 assert_file "--repos-from-snapshot restores the tree" "$OFFR/Projects/tool/bin/tool"
-assert_not_file "--repos-from-snapshot needs no clone (no .git)" "$OFFR/Projects/tool/.git"
-assert_contains "the embedded copy includes tracked uncommitted edits" "$(cat "$OFFR/Projects/tool/bin/tool")" "local tweak"
+assert_contains "--repos-from-snapshot uses the history bundle" "$o_out" "restored from the snapshot's history bundle (--repos-from-snapshot)"
+assert_eq "the bundle restore keeps the history" "$(git -C "$RSRC/Projects/tool" rev-parse HEAD~1)" "$(git -C "$OFFR/Projects/tool" rev-parse HEAD)"
+assert_eq "the bundle restore is complete (connectivity)" "0" "$(git -C "$OFFR/Projects/tool" fsck --connectivity-only >/dev/null 2>&1; echo $?)"
+assert_eq "the bundle restore sets the recorded origin" "$REPO_BARE" "$(git -C "$OFFR/Projects/tool" remote get-url origin)"
+assert_contains "the bundle restore reapplies tracked uncommitted edits" "$(cat "$OFFR/Projects/tool/bin/tool")" "local tweak"
 assert_not_file "untracked files are not in the embedded copy" "$OFFR/Projects/tool/notes.txt"
 assert_eq "restored link works from the embedded copy" "tool-v1" "$(HOME="$OFFR" "$OFFR/.local/bin/tool" 2>/dev/null | head -1 || true)"
-assert_contains "restore explains how to reconnect git later" "$o_out" "git remote add origin $REPO_BARE"
+# Without a bundle (older snapshot): file-only copy.
+NOBUN="$(new_home repo_nobundle)"; HOME="$NOBUN" omarchy-backup init >/dev/null 2>&1
+mkdir -p "$NOBUN/.local/share/omarchy-backup/snapshots/withrepo"; cp "$RSNAP"/* "$NOBUN/.local/share/omarchy-backup/snapshots/withrepo/"
+jq 'del(.repos[0].history_bundle)' "$RSNAP/manifest.json" > "$NOBUN/.local/share/omarchy-backup/snapshots/withrepo/manifest.json"
+nb_out="$(HOME="$NOBUN" omarchy-backup restore withrepo --repos-from-snapshot 2>&1)"
+assert_not_file "without a bundle the file-only copy has no .git" "$NOBUN/Projects/tool/.git"
+assert_contains "the file-only copy includes tracked uncommitted edits" "$(cat "$NOBUN/Projects/tool/bin/tool")" "local tweak"
+assert_contains "restore explains how to reconnect git later" "$nb_out" "git remote add origin $REPO_BARE"
 DEADR="$(new_home repo_deadremote)"; HOME="$DEADR" omarchy-backup init >/dev/null 2>&1
 mkdir -p "$DEADR/.local/share/omarchy-backup/snapshots/withrepo"; cp "$RSNAP"/* "$DEADR/.local/share/omarchy-backup/snapshots/withrepo/"
 jq --arg r "$WORK/does-not-exist.git" '.repos[0].remote=$r' "$RSNAP/manifest.json" > "$DEADR/.local/share/omarchy-backup/snapshots/withrepo/manifest.json"
 d_out="$(HOME="$DEADR" omarchy-backup restore withrepo 2>&1)"
 assert_file "unreachable remote falls back to the embedded copy" "$DEADR/Projects/tool/bin/tool"
-assert_contains "the fallback is reported" "$d_out" "restored from the snapshot's embedded copy (cloning failed)"
+assert_contains "the fallback is reported" "$d_out" "restored from the snapshot's history bundle (cloning failed)"
+
+echo "== repos without a remote: history bundle, globs, doctor =="
+LONE="$(new_home repo_lone_home)"; HOME="$LONE" omarchy-backup init >/dev/null 2>&1
+mkdir -p "$LONE/Work/plugin-a" "$LONE/Work/plain-folder" "$LONE/Work/plugin-b"
+git init -q -b main "$LONE/Work/plugin-a"
+echo v1 > "$LONE/Work/plugin-a/a.php"; $G -C "$LONE/Work/plugin-a" add -A; $G -C "$LONE/Work/plugin-a" commit -q -m one
+$G -C "$LONE/Work/plugin-a" tag v1.0
+$G -C "$LONE/Work/plugin-a" checkout -q -b feature; echo f > "$LONE/Work/plugin-a/f.php"
+$G -C "$LONE/Work/plugin-a" add -A; $G -C "$LONE/Work/plugin-a" commit -q -m feat; $G -C "$LONE/Work/plugin-a" checkout -q main
+echo v2 >> "$LONE/Work/plugin-a/a.php"; $G -C "$LONE/Work/plugin-a" commit -q -am two
+echo "wip" >> "$LONE/Work/plugin-a/a.php"
+echo notes > "$LONE/Work/plain-folder/x.txt"
+lone_doc="$(HOME="$LONE" omarchy-backup doctor 2>&1)"
+assert_contains "doctor flags an undeclared repo without remote" "$lone_doc" "~/Work/plugin-a (no remote; not backed up)"
+echo "include ~/Work" > "$LONE/.config/omarchy-backup/paths.d/work.conf"
+lone_doc="$(HOME="$LONE" omarchy-backup doctor 2>&1)"
+assert_contains "doctor explains that an included repo loses its history" "$lone_doc" "~/Work/plugin-a (no remote; files backed up, history not)"
+# Declared later via a glob: a repo created after the drop-in is picked up too.
+echo "repo ~/Work/*" >> "$LONE/.config/omarchy-backup/paths.d/work.conf"
+git init -q -b main "$LONE/Work/plugin-b"; echo b > "$LONE/Work/plugin-b/b.php"
+$G -C "$LONE/Work/plugin-b" add -A; $G -C "$LONE/Work/plugin-b" commit -q -m b
+lone_doc="$(HOME="$LONE" omarchy-backup doctor 2>&1)"
+assert_contains "a glob-declared repo without remote is no longer flagged" "$lone_doc" "$(printf '%-28s %s' 'Unprotected git history' 'OK')"
+assert_contains "glob-declared repos need no origin" "$lone_doc" "$(printf '%-28s %s' 'Own git checkouts' 'OK')"
+lone_snap="$(HOME="$LONE" omarchy-backup snapshot lone 2>&1)"
+LSNAP="$LONE/.local/share/omarchy-backup/snapshots/lone"
+assert_eq "the glob declares every git checkout (and only those)" "Work/plugin-a Work/plugin-b" "$(jq -r '[.repos[].path] | sort | join(" ")' "$LSNAP/manifest.json")"
+assert_not_contains "no 'cannot re-clone' warning when a bundle exists" "$lone_snap" "no origin remote"
+assert_contains "the history bundle travels in the payload" "$(zstd -q -d -c "$LSNAP/payload.tar.zst" | tar -t)" ".local/share/omarchy-backup/repo-sources/Work__plugin-a.bundle"
+BUN1="$(sha256sum < "$LONE/.local/share/omarchy-backup/repo-sources/Work__plugin-a.bundle")"
+HOME="$LONE" omarchy-backup snapshot lone-again >/dev/null 2>&1
+assert_eq "an unchanged repo keeps its bundle byte-identical" "$BUN1" "$(sha256sum < "$LONE/.local/share/omarchy-backup/repo-sources/Work__plugin-a.bundle")"
+LREST="$(new_home repo_lone_restore)"; HOME="$LREST" omarchy-backup init >/dev/null 2>&1
+mkdir -p "$LREST/.local/share/omarchy-backup/snapshots/lone"; cp "$LSNAP"/* "$LREST/.local/share/omarchy-backup/snapshots/lone/"
+ldry="$(HOME="$LREST" omarchy-backup restore lone --dry-run 2>&1)"
+assert_contains "dry run announces the bundle restore" "$ldry" "rebuild ~/Work/plugin-a from the snapshot's history bundle"
+lr_out="$(HOME="$LREST" omarchy-backup restore lone 2>&1)"
+assert_eq "restore rebuilds the history of a repo without remote" "$(git -C "$LONE/Work/plugin-a" rev-parse HEAD)" "$(git -C "$LREST/Work/plugin-a" rev-parse HEAD 2>/dev/null)"
+assert_eq "restore brings back the tags" "v1.0" "$(git -C "$LREST/Work/plugin-a" tag 2>/dev/null)"
+assert_eq "restore brings back other branches" "$(git -C "$LONE/Work/plugin-a" rev-parse feature)" "$(git -C "$LREST/Work/plugin-a" rev-parse feature 2>/dev/null)"
+assert_eq "restore checks out the recorded branch" "main" "$(git -C "$LREST/Work/plugin-a" symbolic-ref --short HEAD 2>/dev/null)"
+assert_contains "restore reapplies uncommitted edits on top" "$(cat "$LREST/Work/plugin-a/a.php")" "wip"
+assert_eq "a restored repo without remote has none" "" "$(git -C "$LREST/Work/plugin-a" remote 2>/dev/null)"
+assert_file "non-git folders under an included path come back as files" "$LREST/Work/plain-folder/x.txt"
+assert_eq "restored history has every commit" "$(git -C "$LONE/Work/plugin-a" rev-list --count --all)" "$(git -C "$LREST/Work/plugin-a" rev-list --count --all 2>/dev/null)"
+
+echo "== history bundle: unpushed work on the clone path, edge cases =="
+UP_BARE="$WORK/up-upstream.git"; git init -q --bare -b main "$UP_BARE"
+UPS="$(new_home repo_up_src)"; HOME="$UPS" omarchy-backup init >/dev/null 2>&1
+git clone -q "$UP_BARE" "$UPS/Projects/up" 2>/dev/null
+echo one > "$UPS/Projects/up/f"; $G -C "$UPS/Projects/up" add -A; $G -C "$UPS/Projects/up" commit -q -m one
+git -C "$UPS/Projects/up" push -q origin main 2>/dev/null
+echo two >> "$UPS/Projects/up/f"; $G -C "$UPS/Projects/up" commit -q -am two-unpushed
+$G -C "$UPS/Projects/up" tag local-tag
+$G -C "$UPS/Projects/up" branch side; $G -C "$UPS/Projects/up" checkout -q side
+echo s > "$UPS/Projects/up/s"; $G -C "$UPS/Projects/up" add -A; $G -C "$UPS/Projects/up" commit -q -m side; $G -C "$UPS/Projects/up" checkout -q main
+echo "repo ~/Projects/up" > "$UPS/.config/omarchy-backup/paths.d/r.conf"
+HOME="$UPS" omarchy-backup snapshot up >/dev/null 2>&1
+UPR="$(new_home repo_up_rest)"; HOME="$UPR" omarchy-backup init >/dev/null 2>&1
+mkdir -p "$UPR/.local/share/omarchy-backup/snapshots/up"; cp "$UPS/.local/share/omarchy-backup/snapshots/up"/* "$UPR/.local/share/omarchy-backup/snapshots/up/"
+up_out="$(HOME="$UPR" omarchy-backup restore up 2>&1)"
+assert_contains "the clone path is used when the remote works" "$up_out" "clone $UP_BARE -> ~/Projects/up"
+assert_eq "unpushed commits come back on the clone path" "$(git -C "$UPS/Projects/up" rev-parse main)" "$(git -C "$UPR/Projects/up" rev-parse HEAD 2>/dev/null)"
+assert_eq "the branch stays checked out (not detached)" "main" "$(git -C "$UPR/Projects/up" symbolic-ref --short HEAD 2>/dev/null)"
+assert_eq "an unpublished branch comes back on the clone path" "$(git -C "$UPS/Projects/up" rev-parse side)" "$(git -C "$UPR/Projects/up" rev-parse side 2>/dev/null)"
+assert_eq "a local-only tag comes back on the clone path" "local-tag" "$(git -C "$UPR/Projects/up" tag 2>/dev/null)"
+assert_eq "no helper refs are left behind" "" "$(git -C "$UPR/Projects/up" for-each-ref refs/ob-snapshot 2>/dev/null)"
+assert_eq "origin is the real remote" "$UP_BARE" "$(git -C "$UPR/Projects/up" remote get-url origin 2>/dev/null)"
+# Detached HEAD with a commit no ref reaches: the bundle must be refreshed.
+$G -C "$UPS/Projects/up" checkout -q --detach; echo d >> "$UPS/Projects/up/f"; $G -C "$UPS/Projects/up" commit -q -am detached
+DET="$(git -C "$UPS/Projects/up" rev-parse HEAD)"
+HOME="$UPS" omarchy-backup snapshot up-det >/dev/null 2>&1
+DETR="$(new_home repo_det_rest)"; HOME="$DETR" omarchy-backup init >/dev/null 2>&1
+mkdir -p "$DETR/.local/share/omarchy-backup/snapshots/up-det"; cp "$UPS/.local/share/omarchy-backup/snapshots/up-det"/* "$DETR/.local/share/omarchy-backup/snapshots/up-det/"
+HOME="$DETR" omarchy-backup restore up-det --repos-from-snapshot >/dev/null 2>&1
+assert_eq "a detached-HEAD commit is in the refreshed bundle" "$DET" "$(git -C "$DETR/Projects/up" rev-parse HEAD 2>/dev/null)"
+assert_file "the detached restore has a working tree" "$DETR/Projects/up/f"
+# Detached exactly at a branch tip: the restore must still fill the working tree.
+TIP="$(new_home repo_tip_src)"; HOME="$TIP" omarchy-backup init >/dev/null 2>&1
+git init -q -b main "$TIP/Projects/tip"; echo t > "$TIP/Projects/tip/t"; $G -C "$TIP/Projects/tip" add -A; $G -C "$TIP/Projects/tip" commit -q -m t
+$G -C "$TIP/Projects/tip" tag v1; $G -C "$TIP/Projects/tip" checkout -q v1
+echo "repo ~/Projects/tip" > "$TIP/.config/omarchy-backup/paths.d/r.conf"
+HOME="$TIP" omarchy-backup snapshot tip >/dev/null 2>&1
+TIPR="$(new_home repo_tip_rest)"; HOME="$TIPR" omarchy-backup init >/dev/null 2>&1
+mkdir -p "$TIPR/.local/share/omarchy-backup/snapshots/tip"; cp "$TIP/.local/share/omarchy-backup/snapshots/tip"/* "$TIPR/.local/share/omarchy-backup/snapshots/tip/"
+HOME="$TIPR" omarchy-backup restore tip >/dev/null 2>&1
+assert_file "detached at a branch tip: working tree restored" "$TIPR/Projects/tip/t"
+assert_eq "detached at a branch tip: nothing shows as deleted" "" "$(git -C "$TIPR/Projects/tip" status --porcelain 2>/dev/null)"
+# History with an object git fsck rejects (bad timezone) is still imported.
+FS="$(new_home repo_fsck_src)"; HOME="$FS" omarchy-backup init >/dev/null 2>&1
+git init -q -b main "$FS/Projects/old"; echo o > "$FS/Projects/old/o"; git -C "$FS/Projects/old" add -A
+TREE="$(git -C "$FS/Projects/old" write-tree)"
+BADC="$(printf 'tree %s\nauthor t <t@t> 1000000000 +99999\ncommitter t <t@t> 1000000000 +99999\n\nold tool\n' "$TREE" | git -C "$FS/Projects/old" hash-object -t commit -w --literally --stdin)"
+git -C "$FS/Projects/old" update-ref refs/heads/main "$BADC"
+echo "repo ~/Projects/old" > "$FS/.config/omarchy-backup/paths.d/r.conf"
+HOME="$FS" omarchy-backup snapshot old >/dev/null 2>&1
+FSR="$(new_home repo_fsck_rest)"; HOME="$FSR" omarchy-backup init >/dev/null 2>&1
+mkdir -p "$FSR/.local/share/omarchy-backup/snapshots/old"; cp "$FS/.local/share/omarchy-backup/snapshots/old"/* "$FSR/.local/share/omarchy-backup/snapshots/old/"
+fs_out="$(HOME="$FSR" omarchy-backup restore old 2>&1)"
+assert_eq "history git fsck objects to is still restored" "$BADC" "$(git -C "$FSR/Projects/old" rev-parse HEAD 2>/dev/null)"
+assert_contains "the unchecked import is reported" "$fs_out" "imported without that check"
+# Recorded branch exists only in the bundle: checked out as a branch, not detached.
+$G -C "$UPS/Projects/up" checkout -q -b only-local main
+echo ol > "$UPS/Projects/up/ol"; $G -C "$UPS/Projects/up" add -A; $G -C "$UPS/Projects/up" commit -q -m only-local
+sed -i '/exclude \*.bundle/d' "$UPS/.config/omarchy-backup/paths.d/r.conf"
+HOME="$UPS" omarchy-backup snapshot up-ol >/dev/null 2>&1
+OLR="$(new_home repo_ol_rest)"; HOME="$OLR" omarchy-backup init >/dev/null 2>&1
+mkdir -p "$OLR/.local/share/omarchy-backup/snapshots/up-ol"; cp "$UPS/.local/share/omarchy-backup/snapshots/up-ol"/* "$OLR/.local/share/omarchy-backup/snapshots/up-ol/"
+ol_out="$(HOME="$OLR" omarchy-backup restore up-ol 2>&1)"
+assert_eq "a branch only the bundle has is checked out as that branch" "only-local" "$(git -C "$OLR/Projects/up" symbolic-ref --short HEAD 2>/dev/null)"
+assert_not_contains "no misleading 'branch not found' note" "$ol_out" "branch 'only-local' not found"
+# A corrupt bundle falls back to the file-only copy.
+COR="$(new_home repo_corrupt)"; HOME="$COR" omarchy-backup init >/dev/null 2>&1
+mkdir -p "$COR/.local/share/omarchy-backup/snapshots/up"; cp "$UPS/.local/share/omarchy-backup/snapshots/up"/* "$COR/.local/share/omarchy-backup/snapshots/up/"
+mkdir -p "$COR/.local/share/omarchy-backup/repo-sources"
+# The manifest points at a junk file the payload does not overwrite.
+jq '.repos[0].history_bundle=".local/share/omarchy-backup/repo-sources/junk.bundle"' \
+  "$UPS/.local/share/omarchy-backup/snapshots/up/manifest.json" > "$COR/.local/share/omarchy-backup/snapshots/up/manifest.json"
+echo "not a bundle" > "$COR/.local/share/omarchy-backup/repo-sources/junk.bundle"
+c_out="$(HOME="$COR" omarchy-backup restore up --repos-from-snapshot 2>&1)"
+assert_contains "a corrupt bundle is reported" "$c_out" "history bundle could not be read"
+assert_file "a corrupt bundle falls back to the file-only copy" "$COR/Projects/up/f"
+# `exclude *.bundle` keeps history out, and the manifest says so.
+echo "exclude *.bundle" >> "$UPS/.config/omarchy-backup/paths.d/r.conf"
+HOME="$UPS" omarchy-backup snapshot up-nob >/dev/null 2>&1
+assert_eq "an excluded bundle is not advertised in the manifest" "" "$(jq -r '.repos[0].history_bundle' "$UPS/.local/share/omarchy-backup/snapshots/up-nob/manifest.json")"
+assert_eq "an excluded bundle is not in the payload" "0" "$(zstd -q -d -c "$UPS/.local/share/omarchy-backup/snapshots/up-nob/payload.tar.zst" | tar -t | grep -c '\.bundle$')"
+# Globs with spaces; nested repos are not covered by the outer declaration.
+SP="$(new_home repo_spaces)"; HOME="$SP" omarchy-backup init >/dev/null 2>&1
+mkdir -p "$SP/My Work/app/vendor/lib"
+git init -q -b main "$SP/My Work/app"; echo a > "$SP/My Work/app/a"; $G -C "$SP/My Work/app" add a; $G -C "$SP/My Work/app" commit -q -m a
+git init -q -b main "$SP/My Work/app/vendor/lib"; echo l > "$SP/My Work/app/vendor/lib/l"; $G -C "$SP/My Work/app/vendor/lib" add -A; $G -C "$SP/My Work/app/vendor/lib" commit -q -m l
+printf 'repo ~/My Work/*\n' > "$SP/.config/omarchy-backup/paths.d/r.conf"
+printf 'OB_CFG_REPO_SCAN_ROOTS="~/Projects"\n' >> "$SP/.config/omarchy-backup/config.conf"
+echo "include ~/My Work" >> "$SP/.config/omarchy-backup/paths.d/r.conf"
+sp_doc="$(HOME="$SP" omarchy-backup doctor 2>&1)"
+assert_contains "a glob with spaces declares the repo" "$sp_doc" "$(printf '%-28s %s' 'Own git checkouts' 'OK')"
+assert_not_contains "the glob-declared repo is not flagged" "$sp_doc" "~/My Work/app (no remote"
+assert_contains "a nested repo is flagged although its parent is declared" "$sp_doc" "~/My Work/app/vendor/lib (no remote; files backed up, history not)"
 
 echo "== import: a snapshot folder obtained without rclone =="
 DL="$WORK/downloaded/withrepo"; mkdir -p "$DL"; cp "$RSNAP"/* "$DL/"

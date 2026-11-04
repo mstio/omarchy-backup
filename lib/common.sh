@@ -73,6 +73,7 @@ OB_CFG_REMOTE_PATH="omarchy-backup"     # path within the remote
 OB_CFG_RETENTION_REMOTE=3
 OB_CFG_MAX_FILE_SIZE_MB=20
 OB_CFG_SKIP_AUTO_IF_CLEAN="true"
+OB_CFG_REPO_SCAN_ROOTS="~/Projects ~/Work"  # doctor looks for unprotected git repos here
 
 ob_load_config() {
   if [ -f "$OB_CONFIG_FILE" ]; then
@@ -126,6 +127,12 @@ OB_CFG_SKIP_AUTO_IF_CLEAN=true
 # repos are, which logins to redo, ...). Copied to <destination>/<hostname>/
 # RECOVERY.md on every push, so it is readable before anything is installed.
 OB_CFG_RECOVERY_NOTES=
+
+# Space-separated folders where `doctor` looks for git repositories whose
+# history would be lost (no remote / unpushed commits, not declared with
+# `repo`). Included folders are always checked as well. Never crosses into
+# other filesystems (cloud mounts are skipped).
+OB_CFG_REPO_SCAN_ROOTS="~/Projects ~/Work"
 EOF
   ob_info "Wrote default config: $OB_CONFIG_FILE"
 }
@@ -178,8 +185,23 @@ ob_read_path_rules() {
         include) OB_INCLUDES+=("$val") ;;
         exclude) OB_EXCLUDES+=("$val") ;;
         # Own git checkouts (e.g. a tool that ~/.local/bin symlinks into):
-        # recorded as remote + commit, re-cloned on restore, never embedded.
-        repo) OB_REPOS+=("${val%/}") ;;
+        # recorded as remote + commit, re-cloned on restore; the snapshot
+        # also carries their tracked files and full history (git bundle).
+        # A glob (`repo ~/Work/*`) picks up every git checkout it matches,
+        # so new projects need no extra line; non-git matches are skipped.
+        repo)
+          val="${val%/}"
+          case "$val" in
+            *[\*?[]*)
+              # Split on newlines only, so a folder name with spaces works.
+              local m oldifs="$IFS"
+              IFS=$'\n'
+              for m in $val; do
+                [ -d "$m/.git" ] && OB_REPOS+=("${m%/}")
+              done
+              IFS="$oldifs" ;;
+            *) OB_REPOS+=("$val") ;;
+          esac ;;
       esac
     done < "$f"
   done < <(ob_paths_files)

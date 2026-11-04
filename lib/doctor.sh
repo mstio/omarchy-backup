@@ -15,6 +15,73 @@ ob_doctor_check() {
   [ "$status" = "FAIL" ] && OB_DOCTOR_FAIL+=("$label: $detail")
 }
 
+ob_doctor_unprotected_repos() {
+  # Prints one line per at-risk repo: "~/path (reason)".
+  local -a roots=()
+  local w x
+  for w in ${OB_CFG_REPO_SCAN_ROOTS:-}; do
+    w="$(ob_expand_path "$w")"
+    [ -d "$w" ] && roots+=("$w")
+  done
+  local oldifs="$IFS"; IFS=$'\n'
+  for w in "${OB_INCLUDES[@]:-}"; do
+    for x in $w; do
+      [ -d "$x" ] && [ ! -L "$x" ] && roots+=("$x")
+    done
+  done
+  IFS="$oldifs"
+  [ "${#roots[@]}" -gt 0 ] || return 0
+  # Drop duplicates and roots inside another root (scanned once).
+  local -a uniq=()
+  local a b inside
+  for a in "${roots[@]}"; do
+    inside=false
+    for b in "${roots[@]}"; do
+      [ "$a" != "$b" ] && case "$a/" in "${b%/}/"*) inside=true; break ;; esac
+    done
+    [ "$inside" = true ] && continue
+    for b in "${uniq[@]:-}"; do [ "$a" = "$b" ] && inside=true && break; done
+    [ "$inside" = true ] || uniq+=("$a")
+  done
+  roots=("${uniq[@]}")
+  local -A seen=()
+  local g repo r declared included remotes unpushed reason
+  while IFS= read -r -d '' g; do
+    repo="$(dirname -- "$g")"
+    [ -n "${seen[$repo]:-}" ] && continue
+    seen["$repo"]=1
+    case "$repo/" in "$HOME/.config/omarchy/plugins/"*|"$OB_DATA_DIR/"*) continue ;; esac
+    declared=false
+    for r in "${OB_REPOS[@]:-}"; do
+      [ -n "$r" ] || continue
+      # Exact match: a nested repo's history is not in the outer bundle.
+      [ "$repo" = "$r" ] && declared=true && break
+    done
+    [ "$declared" = true ] && continue
+    remotes="$(git -C "$repo" remote 2>/dev/null)"
+    unpushed=0
+    if [ -n "$remotes" ]; then
+      unpushed="$(git -C "$repo" rev-list --count --branches --not --remotes 2>/dev/null || echo 0)"
+      [ "$unpushed" -gt 0 ] 2>/dev/null || continue
+    elif [ -z "$(git -C "$repo" rev-parse --verify -q HEAD 2>/dev/null)" ]; then
+      continue  # no commits yet: no history to lose
+    fi
+    included=false
+    IFS=$'\n'
+    for w in "${OB_INCLUDES[@]:-}"; do
+      for x in $w; do
+        case "$repo/" in "${x%/}/"*) included=true; break 2 ;; esac
+      done
+    done
+    IFS="$oldifs"
+    if [ -n "$remotes" ]; then reason="$unpushed unpushed commit(s)"; else reason="no remote"; fi
+    if [ "$included" = true ]; then reason="$reason; files backed up, history not"
+    else reason="$reason; not backed up"; fi
+    printf '~/%s (%s)\n' "${repo#"$HOME"/}" "$reason"
+  done < <(find "${roots[@]}" -xdev -maxdepth 4 \( -name node_modules -o -name '.cache' \) -prune \
+             -o -name .git -type d -print0 -prune 2>/dev/null)
+}
+
 ob_doctor_run() {
   local auto="${1:-false}"
   ob_ensure_dirs
@@ -160,11 +227,8 @@ ob_doctor_run() {
   local repo_problem="" r top l target
   for r in "${OB_REPOS[@]:-}"; do
     [ -n "$r" ] || continue
-    if [ ! -d "$r/.git" ]; then
-      repo_problem="$repo_problem $r(not a git checkout);"
-    elif [ -z "$(git -C "$r" remote get-url origin 2>/dev/null)" ]; then
-      repo_problem="$repo_problem $r(no origin remote);"
-    fi
+    # No origin is fine: the snapshot carries the history as a git bundle.
+    [ -d "$r/.git" ] || repo_problem="$repo_problem $r(not a git checkout);"
   done
   local -A undeclared=()
   for l in "$HOME/.local/bin"/*; do
@@ -186,7 +250,21 @@ ob_doctor_run() {
   if [ -z "$repo_problem" ]; then
     ob_doctor_check "Own git checkouts" "OK"
   else
-    ob_doctor_check "Own git checkouts" "WARN" "$repo_problem -- Fix: add \`repo <path>\` for each checkout to a drop-in under $OB_PATHS_D_DIR (needs an origin remote), so a restore re-clones it."
+    ob_doctor_check "Own git checkouts" "WARN" "$repo_problem -- Fix: add \`repo <path>\` for each checkout to a drop-in under $OB_PATHS_D_DIR, so a restore brings it back with its history."
+  fi
+
+  # Git repos whose history no backup covers: no remote at all, or commits
+  # no remote has, and not declared with `repo`. Inside an included folder
+  # their files are backed up but `.git` is excluded, so the history is
+  # silently lost. Looks in the included folders plus OB_CFG_REPO_SCAN_ROOTS,
+  # never across filesystems (cloud mounts) and only a few levels deep.
+  local unprotected
+  unprotected="$(ob_doctor_unprotected_repos)"
+  if [ -z "$unprotected" ]; then
+    ob_doctor_check "Unprotected git history" "OK"
+  else
+    local n; n="$(printf '%s\n' "$unprotected" | wc -l)"
+    ob_doctor_check "Unprotected git history" "WARN" "$n repo(s):$(printf '%s\n' "$unprotected" | head -n 8 | sed 's/^/ /' | tr '\n' ';')$([ "$n" -gt 8 ] && echo " ...") -- Fix: push to a remote, or add \`repo <path>\` (or \`repo <folder>/*\`) to a drop-in under $OB_PATHS_D_DIR; snapshots then carry the full history as a git bundle."
   fi
 
   # Restore plausibility: the commands restore.sh relies on still exist

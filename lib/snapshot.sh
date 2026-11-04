@@ -133,15 +133,16 @@ ob_snapshot_create() {
     rm -rf -- "$snap_dir"
     ob_die "Could not collect a valid system inventory. The previous snapshots were left untouched."
   fi
-  # Own git checkouts come back from their remote on restore -- anything not
-  # pushed is at risk, so say so at snapshot time (tracked edits do travel
-  # as a diff in the manifest; untracked files and unpushed commits don't).
+  # Own git checkouts come back from their remote on restore, or from the
+  # snapshot's history bundle. Only without a bundle is anything unpushed at
+  # risk; untracked files never travel (tracked edits do, as a diff).
   local repo_warn
   while IFS= read -r repo_warn; do
     [ -n "$repo_warn" ] && ob_warn "$repo_warn"
   done < <(echo "$inventory" | jq -r '.repos[]? |
     if .missing then "Declared repo ~/\(.path) does not exist (paths.conf: repo)."
-    elif .remote == "" then "Repo ~/\(.path) has no origin remote; a restore cannot re-clone it."
+    elif (.history_bundle // "") != "" then empty
+    elif .remote == "" then "Repo ~/\(.path) has no origin remote and no history bundle; a restore gets its files only."
     elif .ahead < 0 then "Repo ~/\(.path) has no upstream branch; unpushed commits would be lost on restore."
     elif .ahead > 0 then "Repo ~/\(.path) has \(.ahead) unpushed commit(s); a restore only gets what the remote has."
     else empty end,
