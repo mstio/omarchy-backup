@@ -223,6 +223,18 @@ ob_remote_push() {
   local dir="$OB_SNAPSHOTS_DIR/$name"
   ob_snapshot_verify_for_push "$name" || return 1
   ob_remote_ensure_available || return 1
+  # A destination someone else changed is not written to (and nothing on it
+  # is re-recorded) until the user has looked at it.
+  if ob_ledger_has_entries; then
+    local integ_rc=0 integ_out
+    integ_out="$(ob_integrity_check)" || integ_rc=$?
+    if [ "$integ_rc" -eq 1 ]; then
+      ob_err "The backup destination was changed outside this machine; refusing to upload until that is resolved:"
+      printf '%s\n' "$integ_out" | sed 's/^/  /' >&2
+      ob_err "Look at it (omarchy-backup doctor), clean up the destination, then: omarchy-backup integrity forget <name> / integrity reset."
+      return 1
+    fi
+  fi
   local base target
   base="$(ob_remote_base)"
   target="$(ob_remote_snapshot_target "$base" "$name")" \
@@ -241,14 +253,14 @@ ob_remote_push() {
     ob_info "Uploading '$name' to $target/ ..."
     if ! timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS}s" \
         rclone copy "$dir" "$target" \
-        --include manifest.json --include checksums.sha256 --include payload.tar.zst; then
+        --include manifest.json --include manifest.json.sig --include checksums.sha256 --include payload.tar.zst; then
       ob_err "Upload of '$name' failed."
       continue
     fi
     ob_info "Upload copied; verifying remote files against the local snapshot ..."
     if ! timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS}s" \
         rclone check "$dir" "$target" \
-        --include manifest.json --include checksums.sha256 --include payload.tar.zst; then
+        --include manifest.json --include manifest.json.sig --include checksums.sha256 --include payload.tar.zst; then
       ob_err "Remote verification of '$name' failed."
       continue
     fi
@@ -262,9 +274,21 @@ ob_remote_push() {
     return 75
   fi
 
+  # What the destination holds right now must be what this machine just
+  # uploaded: record it (backend hashes where possible). If it is not -- or
+  # cannot be recorded -- the upload counts as failed: not marked pushed,
+  # not indexed, retried by the next run (and the next mismatch alerts).
+  if ! ob_ledger_record "$name"; then
+    ob_err "Upload of '$name' could not be recorded in the integrity ledger (the destination does not show what was uploaded); treating it as not uploaded."
+    ob_notify "omarchy-backup: upload not trustworthy" \
+      "Right after uploading '$name' the destination showed different content. Run 'omarchy-backup doctor'." critical
+    return 75
+  fi
+
   # Mark as pushed in local state, then refresh the remote index.
   local state; state="$(ob_state_read)"
-  state="$(echo "$state" | jq --arg n "$name" '.snapshots |= map(if .name==$n then .remote_pushed=true else . end)')"
+  state="$(echo "$state" | jq --arg n "$name" --argjson t "$(date +%s)" \
+    '.snapshots |= map(if .name==$n then .remote_pushed=true else . end) | .last_push_epoch = $t')"
   ob_state_write "$state" || return 1
 
   ob_remote_refresh_index || return 1
@@ -285,9 +309,8 @@ ob_remote_push_tool_archive() {
         --transform "s|^$(basename -- "$OB_ROOT_DIR")|omarchy-backup|" \
         --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
         -czf "$tmp/omarchy-backup-tool.tar.gz" "$(basename -- "$OB_ROOT_DIR")" 2>/dev/null \
-      && timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS}s" \
-        rclone copyto "$tmp/omarchy-backup-tool.tar.gz" "$base/omarchy-backup-tool.tar.gz" >/dev/null 2>&1; then
-    ob_info "Tool copy uploaded to $base/omarchy-backup-tool.tar.gz."
+      && ob_remote_upload_signed "$tmp/omarchy-backup-tool.tar.gz" "$base" omarchy-backup-tool.tar.gz; then
+    ob_info "Tool copy uploaded to $base/omarchy-backup-tool.tar.gz$([ -f "$tmp/omarchy-backup-tool.tar.gz.sig" ] && echo " (signed)")."
   else
     ob_warn "Could not upload the tool copy to $base/omarchy-backup-tool.tar.gz."
   fi
@@ -307,11 +330,28 @@ ob_remote_push_recovery_notes() {
     ob_warn "Recovery notes $src not found; not uploaded."
     return 0
   fi
-  if timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS}s" \
-      rclone copyto "$src" "$base/RECOVERY.md" >/dev/null 2>&1; then
-    ob_info "Recovery notes uploaded to $base/RECOVERY.md."
+  local tmp; tmp="$(mktemp -d)" || return 0
+  if cp -- "$src" "$tmp/RECOVERY.md" && ob_remote_upload_signed "$tmp/RECOVERY.md" "$base" RECOVERY.md; then
+    ob_info "Recovery notes uploaded to $base/RECOVERY.md$([ -f "$tmp/RECOVERY.md.sig" ] && echo " (signed)")."
   else
     ob_warn "Could not upload recovery notes to $base/RECOVERY.md."
+  fi
+  rm -rf -- "$tmp"
+  return 0
+}
+
+# Uploads <local file> (signed with the snapshot key, if configured) to
+# <base>/<name>, then records both in the integrity ledger.
+ob_remote_upload_signed() {  # <local file> <base> <remote name>
+  local f="$1" base="$2" rname="$3"
+  ob_sig_sign_file "$f" || true
+  timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS}s" \
+    rclone copyto "$f" "$base/$rname" >/dev/null 2>&1 || return 1
+  ob_ledger_note_base "$rname" "$f" || true
+  if [ -f "$f.sig" ]; then
+    timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS}s" \
+      rclone copyto "$f.sig" "$base/$rname.sig" >/dev/null 2>&1 || return 1
+    ob_ledger_note_base "$rname.sig" "$f.sig" || true
   fi
   return 0
 }
@@ -409,6 +449,7 @@ ob_remote_refresh_index() {
     ob_err "Could not update remote snapshot index."
     return 1
   fi
+  ob_ledger_note_base index.json "$tmp" || true
   rm -f "$tmp"
 }
 
@@ -455,6 +496,7 @@ ob_remote_enforce_retention() {
     local pruned_state
     pruned_state="$(ob_state_read | jq --arg n "$n" '.snapshots |= map(if .name==$n then .remote_pushed=false else . end)')" \
       && ob_state_write "$pruned_state"
+    ob_ledger_forget "$n"
   done <<< "$excess"
   local tmp index_target; tmp="$(mktemp)"
   echo "$retained" | jq . > "$tmp"
@@ -466,6 +508,7 @@ ob_remote_enforce_retention() {
     ob_err "Could not write the pruned remote snapshot index."
     return 1
   fi
+  ob_ledger_note_base index.json "$tmp" || true
   rm -f "$tmp"
 }
 
@@ -480,19 +523,52 @@ ob_remote_list() {
 }
 
 ob_remote_pull() {
-  local name="$1" dest="${2:-$OB_SNAPSHOTS_DIR/$name}"
+  # ob_remote_pull <name> [dest] -- downloads into a private staging folder
+  # and moves it into place only after the ledger (and, for `pull` without
+  # dest, the signature) check passed. An existing snapshot is never
+  # replaced or removed.
+  local name="$1" dest gate=false
+  dest="${2:-$OB_SNAPSHOTS_DIR/$name}"  # separate: `local a=1 b=$a` expands $a before assigning
+  [ $# -lt 2 ] && gate=true
   ob_require_snapshot_name "$name"
   ob_remote_configured || ob_die "No remote configured."
-  local base target
+  if [ -e "$dest" ]; then
+    ob_die "A local snapshot '$name' already exists ($dest); not overwritten. Remove it first if you really want the remote copy."
+  fi
+  ob_sweep_stale_staging
+  local base target stage
   base="$(ob_remote_base)"
   target="$(ob_remote_snapshot_target "$base" "$name")" \
     || ob_die "Refusing unsafe remote snapshot target for '$name'."
-  mkdir -p "$dest"
+  mkdir -p -- "$(dirname -- "$dest")"
+  stage="$(dirname -- "$dest")/.$name.pull.$$"
+  rm -rf -- "${stage:?}"; mkdir -m 700 -- "$stage" || ob_die "Could not create $stage"
   ob_info "Downloading '$name' from $base/$name/ ..."
-  timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS}s" \
-    rclone copy "$target" "$dest" \
-      --include manifest.json --include checksums.sha256 --include payload.tar.zst \
-    || ob_die "Download failed or exceeded its safety deadline: $name"
-  [ -f "$dest/manifest.json" ] || ob_die "Download incomplete or snapshot not found on remote: $name"
+  if ! timeout --signal=TERM --kill-after=5s "${OB_REMOTE_OPERATION_TIMEOUT_SECONDS}s" \
+      rclone copy "$target" "$stage" \
+        --include manifest.json --include manifest.json.sig --include checksums.sha256 --include payload.tar.zst; then
+    rm -rf -- "${stage:?}"
+    ob_die "Download failed or exceeded its safety deadline: $name"
+  fi
+  if [ ! -f "$stage/manifest.json" ]; then
+    rm -rf -- "${stage:?}"
+    ob_die "Download incomplete or snapshot not found on remote: $name"
+  fi
+  # This machine's ledger (if it uploaded the snapshot) knows the hashes.
+  local f want have
+  for f in manifest.json manifest.json.sig checksums.sha256 payload.tar.zst; do
+    want="$(ob_ledger_read | jq -r --arg n "$name" --arg f "$f" '.snapshots[$n].files[$f].md5 // ""')"
+    [ -n "$want" ] || continue
+    have="$(md5sum -- "$stage/$f" 2>/dev/null | awk '{print $1}')"
+    if [ "$have" != "$want" ]; then
+      rm -rf -- "${stage:?}"
+      ob_die "Downloaded $name/$f differs from what this machine uploaded (integrity ledger) -- the destination was modified; nothing kept."
+    fi
+  done
+  if [ "$gate" = true ] && ! ob_sig_gate "$stage" "keeping the download"; then
+    rm -rf -- "${stage:?}"
+    ob_die "Download of '$name' not kept."
+  fi
+  mv -- "$stage" "$dest" || { rm -rf -- "${stage:?}"; ob_die "Could not move the download into $dest"; }
   ob_info "Downloaded to $dest"
 }

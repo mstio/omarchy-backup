@@ -16,6 +16,10 @@ declare -A OB_CFG_VALIDATORS=(
   [OB_CFG_SKIP_AUTO_IF_CLEAN]=ob_cfg_validate_bool
   [OB_CFG_RECOVERY_NOTES]=ob_cfg_validate_anything
   [OB_CFG_REPO_SCAN_ROOTS]=ob_cfg_validate_anything
+  [OB_CFG_INTEGRITY_RCLONE_REMOTE]=ob_cfg_validate_anything
+  [OB_CFG_SIGNING_KEY]=ob_cfg_validate_anything
+  [OB_CFG_SIGNER_GITHUB]=ob_cfg_validate_anything
+  [OB_CFG_ALLOWED_SIGNERS]=ob_cfg_validate_anything
 )
 
 ob_cfg_validate_bool() { case "$1" in true|false) return 0 ;; *) return 1 ;; esac; }

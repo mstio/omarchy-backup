@@ -75,6 +75,7 @@ ob_inv_plugins() {
   disabled="$(echo "$plugin_json" | jq '[.[] | select(.enabled==false) | .id]')"
 
   local git_managed="[]" local_managed="[]"
+  local gm_file; gm_file="$(mktemp)"
   if [ -d "$plugins_dir" ]; then
     local d id remote commit dirty entry
     for d in "$plugins_dir"/*/; do
@@ -84,22 +85,25 @@ ob_inv_plugins() {
         remote="$(git -C "$d" remote get-url origin 2>/dev/null || echo "")"
         commit="$(git -C "$d" rev-parse HEAD 2>/dev/null || echo "")"
         if [ -n "$(git -C "$d" status --porcelain 2>/dev/null)" ]; then dirty=true; else dirty=false; fi
-        local diff=""
+        # Diffs can exceed the kernel's 128 KiB per-argument limit: they go
+        # through files, never through jq's command line.
+        local difff; difff="$(mktemp)"
         if [ "$dirty" = true ]; then
-          diff="$(git -C "$d" diff HEAD 2>/dev/null || true)"
+          git -C "$d" diff HEAD > "$difff" 2>/dev/null || true
         fi
-        entry="$(jq -n --arg id "$id" --arg remote "$remote" --arg commit "$commit" \
-          --argjson dirty "$dirty" --arg diff "$diff" \
-          '{id:$id, remote:$remote, commit:$commit, dirty:$dirty, diff:$diff}')"
-        git_managed="$(echo "$git_managed" | jq --argjson e "$entry" '. + [$e]')"
+        jq -n --arg id "$id" --arg remote "$remote" --arg commit "$commit" \
+          --argjson dirty "$dirty" --rawfile diff "$difff" \
+          '{id:$id, remote:$remote, commit:$commit, dirty:$dirty, diff:$diff}' >> "$gm_file"
+        rm -f -- "$difff"
       else
         local_managed="$(echo "$local_managed" | jq --arg id "$id" '. + [$id]')"
       fi
     done
   fi
   jq -n --argjson enabled "$enabled" --argjson disabled "$disabled" \
-    --argjson git_managed "$git_managed" --argjson local_managed "$local_managed" \
+    --slurpfile git_managed "$gm_file" --argjson local_managed "$local_managed" \
     '{enabled:$enabled, disabled:$disabled, git_managed:$git_managed, local_managed:$local_managed}'
+  rm -f -- "$gm_file"
 }
 
 # Embedded source copy of each declared repo (tracked files as they are in
@@ -119,28 +123,58 @@ ob_repo_bundle_file() {  # <path relative to $HOME> -> history bundle path
 }
 
 # Suggested by an omarchy-backup user (2026-11): repos without a remote lost
-# their history on restore. Full history of a declared repo (all branches, tags, remote-tracking refs)
-# as a `git bundle`, next to the source archive. Without it a repo that has
-# no remote -- or commits the remote never got -- would come back without
-# its history. Rewritten only when a ref moved (a sidecar `.refs` file holds
-# the ref list), because `git bundle` output is not guaranteed to be
-# byte-identical and an unchanged repo must not show up as drift.
+# their history on restore. Each declared repo gets a history `git bundle`
+# next to its source archive, sized to what a restore could otherwise lose:
+#   full  -- `--all`: repos without an origin remote, and `repo <path> full`
+#   delta -- only what origin lacks: unpushed commits (all branches, HEAD)
+#            plus annotated tags; nothing at all when everything is pushed.
+#            Restored on top of a fresh clone (its prerequisites come from
+#            the remote). Local-only branches/lightweight tags that point at
+#            pushed commits carry no objects; they are kept as `local_refs`
+#            in the manifest instead.
+# Rewritten only when a ref (incl. the origin/* refs that define the delta)
+# or HEAD moved (sidecar `.refs`), because `git bundle` output is not
+# guaranteed to be byte-identical and an unchanged repo must not drift.
+ob_repo_bundle_mode() {  # <repo path> -> full|delta
+  if [ -n "${OB_REPO_FULL[$1]:-}" ] || [ -z "$(git -C "$1" remote get-url origin 2>/dev/null)" ]; then
+    echo full
+  else
+    echo delta
+  fi
+}
+
+ob_repo_missing_commits() {  # <repo path> -> commits no origin/* ref has
+  local head=()
+  git -C "$1" rev-parse -q --verify HEAD >/dev/null 2>&1 && head=(HEAD)
+  git -C "$1" rev-list --count --branches "${head[@]}" --not --remotes=origin 2>/dev/null || echo 0
+}
+
 ob_repo_bundle_refresh() {  # <repo path> <path relative to $HOME>
-  local p="$1" out refs tmp
+  local p="$1" out refs tmp mode head=()
   out="$(ob_repo_bundle_file "$2")"
+  mode="$(ob_repo_bundle_mode "$p")"
   refs="$(git -C "$p" for-each-ref --format='%(objectname) %(refname)' 2>/dev/null)" || return 1
   if [ -z "$refs" ]; then  # no commits yet: nothing to bundle
     rm -f -- "$out" "$out.refs"
     return 0
   fi
+  git -C "$p" rev-parse -q --verify HEAD >/dev/null 2>&1 && head=(HEAD)
+  if [ "$mode" = delta ] && [ "$(ob_repo_missing_commits "$p")" = 0 ] \
+      && ! git -C "$p" for-each-ref --format='%(objecttype)' refs/tags | grep -qx tag; then
+    rm -f -- "$out" "$out.refs"  # everything is at origin: metadata suffices
+    return 0
+  fi
   # HEAD too: commits on a detached HEAD move no ref.
-  refs="$refs
+  refs="mode $mode
+$refs
 $(git -C "$p" rev-parse -q --verify HEAD 2>/dev/null) HEAD"
   if [ -f "$out" ] && [ -f "$out.refs" ] && [ "$(cat -- "$out.refs")" = "$refs" ]; then
     return 0
   fi
   tmp="$out.tmp.$$"
-  if ! git -C "$p" bundle create --quiet "$tmp" --all >/dev/null 2>&1; then
+  local -a what=(--all)
+  [ "$mode" = delta ] && what=(--branches --tags "${head[@]}" --not --remotes=origin)
+  if ! git -C "$p" bundle create --quiet "$tmp" "${what[@]}" >/dev/null 2>&1; then
     rm -f -- "$tmp"
     return 1
   fi
@@ -220,8 +254,9 @@ ob_inv_repos() {
     remote="$(git -C "$p" remote get-url origin 2>/dev/null || echo "")"
     branch="$(git -C "$p" symbolic-ref --quiet --short HEAD 2>/dev/null || echo "")"
     commit="$(git -C "$p" rev-parse HEAD 2>/dev/null || echo "")"
-    diff="$(git -C "$p" diff HEAD 2>/dev/null || true)"
-    if [ -n "$diff" ]; then dirty=true; else dirty=false; fi
+    local difff; difff="$(mktemp)"
+    git -C "$p" diff HEAD > "$difff" 2>/dev/null || true
+    if [ -s "$difff" ]; then dirty=true; else dirty=false; fi
     # Commits the remote does not have (-1: no upstream configured).
     ahead="$(git -C "$p" rev-list --count '@{u}..HEAD' 2>/dev/null || echo -1)"
     untracked="$(git -C "$p" ls-files --others --exclude-standard 2>/dev/null | wc -l)"
@@ -231,13 +266,28 @@ ob_inv_repos() {
     local src; src="$(ob_repo_source_file "$rel")"
     if ob_repo_source_in_payload "$src"; then src="${src#"$HOME"/}"; else src=""; fi
     local bun; bun="$(ob_repo_bundle_file "$rel")"
-    if ob_repo_source_in_payload "$bun"; then bun="${bun#"$HOME"/}"; else bun=""; fi
+    local bkind="" missing_commits=0 lreff; lreff="$(mktemp)"; echo '[]' > "$lreff"
+    if ob_repo_source_in_payload "$bun"; then
+      bun="${bun#"$HOME"/}"
+      bkind="$(head -n 1 -- "$HOME/$bun.refs" 2>/dev/null | sed -n 's/^mode \(full\|delta\)$/\1/p')"
+      [ -n "$bkind" ] || bkind=full
+    else
+      bun=""
+    fi
+    if [ -n "$remote" ]; then
+      missing_commits="$(ob_repo_missing_commits "$p")"
+      git -C "$p" for-each-ref --format='%(refname) %(objectname)' refs/heads refs/tags 2>/dev/null \
+        | jq -R 'split(" ") | select(length==2) | {ref:.[0], sha:.[1]}' | jq -s . > "$lreff"
+    fi
     jq -n --arg path "$rel" --arg remote "$remote" --arg branch "$branch" --arg commit "$commit" \
-      --argjson dirty "$dirty" --arg diff "$diff" --argjson ahead "$ahead" --argjson untracked "$untracked" \
-      --arg source_archive "$src" --arg history_bundle "$bun" \
+      --argjson dirty "$dirty" --rawfile diff "$difff" --argjson ahead "$ahead" --argjson untracked "$untracked" \
+      --arg source_archive "$src" --arg history_bundle "$bun" --arg history_bundle_kind "$bkind" \
+      --argjson missing_commits "${missing_commits:-0}" --slurpfile local_refs "$lreff" \
       '{path:$path, remote:$remote, branch:$branch, commit:$commit, dirty:$dirty, diff:$diff,
         ahead:$ahead, untracked:$untracked, source_archive:$source_archive,
-        history_bundle:$history_bundle, missing:false}'
+        history_bundle:$history_bundle, history_bundle_kind:$history_bundle_kind,
+        missing_commits:$missing_commits, local_refs:$local_refs[0], missing:false}'
+    rm -f -- "$difff" "$lreff"
   done | jq -s .
 }
 
@@ -258,6 +308,10 @@ ob_inv_systemd_user_units() {
 }
 
 ob_inv_all() {
+  # Plugins and repos carry diffs: passed as files (argument size limit).
+  local pf rf rc=0
+  pf="$(mktemp)"; rf="$(mktemp)"
+  ob_inv_plugins > "$pf"; ob_inv_repos > "$rf"
   jq -n \
     --arg omarchy_version "$(ob_inv_omarchy_version)" \
     --arg kernel "$(ob_inv_kernel_version)" \
@@ -266,16 +320,45 @@ ob_inv_all() {
     --argjson aur_foreign "$(ob_inv_aur_foreign)" \
     --argjson flatpak "$(ob_inv_flatpak)" \
     --argjson appimages "$(ob_inv_appimages)" \
-    --argjson plugins "$(ob_inv_plugins)" \
+    --slurpfile plugins "$pf" \
     --argjson systemd_user_units "$(ob_inv_systemd_user_units)" \
-    --argjson repos "$(ob_inv_repos)" \
+    --slurpfile repos "$rf" \
     '{
       omarchy_version:$omarchy_version,
       kernel:$kernel,
       hyprland_version:$hyprland_version,
       packages: {pacman_explicit:$pacman_explicit, aur_foreign:$aur_foreign, flatpak:$flatpak, appimages:$appimages},
-      plugins:$plugins,
+      plugins:$plugins[0],
       systemd_user_units:$systemd_user_units,
-      repos:$repos
-    }'
+      repos:$repos[0]
+    }' || rc=$?
+  rm -f -- "$pf" "$rf"
+  return "$rc"
+}
+
+# What each declared repo's snapshot carries, from the live checkout (no
+# network): "full history", "missing commits only (N)" or "metadata only".
+ob_repo_modes_report() {
+  local p rel mode n
+  for p in "${OB_REPOS[@]:-}"; do
+    [ -n "$p" ] && [ -d "$p/.git" ] || continue
+    rel="~/${p#"$HOME"/}"
+    mode="$(ob_repo_bundle_mode "$p")"
+    if [ "$mode" = full ]; then
+      if [ -n "${OB_REPO_FULL[$p]:-}" ]; then
+        printf '  %s: full history (repo ... full)\n' "$rel"
+      else
+        printf '  %s: full history (no origin remote)\n' "$rel"
+      fi
+    else
+      n="$(ob_repo_missing_commits "$p")"
+      local stash=""
+      git -C "$p" rev-parse -q --verify refs/stash >/dev/null 2>&1 && stash=" -- git stash is NOT kept (only with \`full\`)"
+      if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
+        printf '  %s: missing commits only (%s)%s\n' "$rel" "$n" "$stash"
+      else
+        printf '  %s: metadata only%s\n' "$rel" "$stash"
+      fi
+    fi
+  done
 }

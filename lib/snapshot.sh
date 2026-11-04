@@ -133,18 +133,20 @@ ob_snapshot_create() {
     rm -rf -- "$snap_dir"
     ob_die "Could not collect a valid system inventory. The previous snapshots were left untouched."
   fi
-  # Own git checkouts come back from their remote on restore, or from the
-  # snapshot's history bundle. Only without a bundle is anything unpushed at
-  # risk; untracked files never travel (tracked edits do, as a diff).
+  # Own git checkouts come back from their remote on restore, plus whatever
+  # the snapshot's history bundle holds (everything without an origin or
+  # with `full`, otherwise only what origin lacks). Only without a bundle is
+  # anything unpushed at risk; untracked files never travel (tracked edits
+  # do, as a diff).
   local repo_warn
   while IFS= read -r repo_warn; do
     [ -n "$repo_warn" ] && ob_warn "$repo_warn"
   done < <(echo "$inventory" | jq -r '.repos[]? |
     if .missing then "Declared repo ~/\(.path) does not exist (paths.conf: repo)."
+    elif .remote == "" and (.history_bundle // "") == "" then "Repo ~/\(.path) has no origin remote and no history bundle; a restore gets its files only."
+    elif .remote == "" then empty
     elif (.history_bundle // "") != "" then empty
-    elif .remote == "" then "Repo ~/\(.path) has no origin remote and no history bundle; a restore gets its files only."
-    elif .ahead < 0 then "Repo ~/\(.path) has no upstream branch; unpushed commits would be lost on restore."
-    elif .ahead > 0 then "Repo ~/\(.path) has \(.ahead) unpushed commit(s); a restore only gets what the remote has."
+    elif (.missing_commits // 0) > 0 then "Repo ~/\(.path) has \(.missing_commits) commit(s) its remote lacks, and they are not in the snapshot (bundle excluded or failed); a restore only gets what the remote has."
     else empty end,
     (select((.untracked // 0) > 0) | "Repo ~/\(.path): \(.untracked) untracked file(s) are not part of the backup.")')
   local payload_sha payload_size
@@ -161,7 +163,9 @@ ob_snapshot_create() {
   skipped_large_json="$(printf '%s\n' "${OB_SKIPPED_LARGE[@]:-}" | jq -R 'select(length>0)' | jq -s .)"
   skipped_secret_json="$(printf '%s\n' "${OB_SKIPPED_SECRET[@]:-}" | jq -R 'select(length>0)' | jq -s .)"
 
-  local manifest
+  # The inventory carries diffs (can exceed the 128 KiB argument limit).
+  local manifest invf; invf="$(mktemp)"
+  printf '%s' "$inventory" > "$invf"
   if ! manifest="$(jq -n \
     --arg schema_version "1" \
     --arg name "$name" \
@@ -169,14 +173,15 @@ ob_snapshot_create() {
     --arg hostname "$(ob_hostname)" \
     --arg tool_version "$OB_VERSION" \
     --argjson baseline "$mark_baseline" \
-    --argjson inventory "$inventory" \
+    --slurpfile inv "$invf" \
     --argjson skipped_large "$skipped_large_json" \
     --argjson skipped_secret "$skipped_secret_json" \
     --arg payload_file "payload.tar.zst" \
     --arg payload_sha256 "$payload_sha" \
     --argjson payload_size "$payload_size" \
     --argjson file_count "${#OB_RESOLVED_FILES[@]}" \
-    '{
+    --arg checksums_sha256 "$(sha256sum -- "$snap_dir/checksums.sha256" | awk '{print $1}')" \
+    '$inv[0] as $inventory | {
       schema_version: ($schema_version|tonumber),
       name:$name, created_at:$created_at, hostname:$hostname, tool_version:$tool_version,
       baseline:$baseline,
@@ -190,11 +195,18 @@ ob_snapshot_create() {
       skipped_large_files:$skipped_large,
       skipped_secret_files:$skipped_secret,
       payload: {file:$payload_file, sha256:$payload_sha256, size_bytes:$payload_size},
+      checksums_sha256:$checksums_sha256,
       file_count:$file_count
     }')" || ! echo "$manifest" | jq . > "$snap_dir/manifest.json"; then
+    rm -f -- "$invf"
     rm -rf -- "$snap_dir"
     ob_die "Could not write a valid snapshot manifest. The previous snapshots were left untouched."
   fi
+
+  rm -f -- "$invf"
+  # Signed before it becomes visible; an unsigned snapshot is still a
+  # snapshot (local first), doctor reports the missing key.
+  ob_sig_sign "$snap_dir" || true
 
   if ! mv -- "$snap_dir" "$final_snap_dir"; then
     rm -rf -- "$snap_dir"
@@ -270,6 +282,8 @@ ob_snapshot_import() {
   stored="$(jq -r '.payload.sha256 // ""' "$src/manifest.json")"
   actual="$(sha256sum -- "$src/payload.tar.zst" | awk '{print $1}')"
   [ -n "$stored" ] && [ "$stored" = "$actual" ] || ob_die "Payload checksum mismatch in $src -- the download is incomplete or corrupt."
+  ob_load_config
+  ob_sig_gate "$src" "the import" || exit 1
   local state; state="$(ob_state_read)"
   if [ -e "$OB_SNAPSHOTS_DIR/$name" ] || echo "$state" | jq -e --arg n "$name" '.snapshots[] | select(.name==$n)' >/dev/null; then
     ob_die "A snapshot named '$name' already exists locally; nothing imported."
@@ -278,8 +292,9 @@ ob_snapshot_import() {
     || ob_die "All $OB_MAX_SNAPSHOTS local snapshot slots are in use; free one before importing."
   local stage="$OB_SNAPSHOTS_DIR/.${name}.import.$$"
   mkdir -p -- "$stage" || ob_die "Could not create $stage"
-  if ! cp -- "$src/manifest.json" "$src/checksums.sha256" "$src/payload.tar.zst" "$stage/" \
-      || ! mv -- "$stage" "$OB_SNAPSHOTS_DIR/$name"; then
+  local -a files=("$src/manifest.json" "$src/checksums.sha256" "$src/payload.tar.zst")
+  [ -f "$src/manifest.json.sig" ] && files+=("$src/manifest.json.sig")
+  if ! cp -- "${files[@]}" "$stage/" || ! mv -- "$stage" "$OB_SNAPSHOTS_DIR/$name"; then
     rm -rf -- "$stage"
     ob_die "Could not copy the snapshot into $OB_SNAPSHOTS_DIR."
   fi

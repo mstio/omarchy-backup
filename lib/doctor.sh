@@ -264,7 +264,57 @@ ob_doctor_run() {
     ob_doctor_check "Unprotected git history" "OK"
   else
     local n; n="$(printf '%s\n' "$unprotected" | wc -l)"
-    ob_doctor_check "Unprotected git history" "WARN" "$n repo(s):$(printf '%s\n' "$unprotected" | head -n 8 | sed 's/^/ /' | tr '\n' ';')$([ "$n" -gt 8 ] && echo " ...") -- Fix: push to a remote, or add \`repo <path>\` (or \`repo <folder>/*\`) to a drop-in under $OB_PATHS_D_DIR; snapshots then carry the full history as a git bundle."
+    ob_doctor_check "Unprotected git history" "WARN" "$n repo(s):$(printf '%s\n' "$unprotected" | head -n 8 | sed 's/^/ /' | tr '\n' ';')$([ "$n" -gt 8 ] && echo " ...") -- Fix: push to a remote, or add \`repo <path>\` (or \`repo <folder>/*\`) to a drop-in under $OB_PATHS_D_DIR; snapshots then carry what only this machine has of their history (all of it with \`repo <path> full\`)."
+  fi
+
+  # Integrity of the destination against this machine's ledger.
+  if ob_remote_configured && ob_remote_ensure_available --check >/dev/null 2>&1; then
+    local integ_out integ_rc integ_mode
+    integ_out="$(ob_integrity_check $([ "$auto" = true ] && echo --notify))"; integ_rc=$?
+    integ_mode="$(jq -r '.mode // ""' "$OB_INTEGRITY_STATUS_FILE" 2>/dev/null)"
+    if [ "$integ_rc" -eq 1 ]; then
+      ob_doctor_check "Destination integrity" "FAIL" "changed outside this machine:$(printf '%s\n' "$integ_out" | sed 's/^/ /' | tr '\n' ';') -- Fix: do NOT restore from these snapshots; delete them on the destination, find out who could write there, then push a fresh snapshot."
+    elif [ "$integ_rc" -ne 0 ]; then
+      ob_doctor_check "Destination integrity" "WARN" "could not list the destination -- Fix: check the connection, then \`omarchy-backup integrity check\`."
+    elif [ "$(ob_ledger_read | jq '.snapshots | length')" -eq 0 ]; then
+      ob_doctor_check "Destination integrity" "WARN" "no upload recorded in the integrity ledger yet -- Fix: push a snapshot (\`omarchy-backup push <name>\`); older uploads can be adopted after review with \`omarchy-backup integrity record <name>\`."
+    elif [ "$integ_mode" = weak ]; then
+      ob_doctor_check "Destination integrity" "WARN" "matches the ledger, but only by size and date: the destination is a mounted cloud folder, and hashing it would download every file -- Fix: set OB_CFG_INTEGRITY_RCLONE_REMOTE to the same folder as an rclone spec (e.g. \"mydrive:backups/omarchy\") to compare the backend's MD5 hashes."
+    elif [ "$(jq '.unrecorded | length' "$OB_INTEGRITY_STATUS_FILE" 2>/dev/null || echo 0)" -gt 0 ]; then
+      ob_doctor_check "Destination integrity" "WARN" "uploaded before the ledger existed:$(jq -r '.unrecorded[]' "$OB_INTEGRITY_STATUS_FILE" | sed 's/^/ /' | tr '\n' ';') -- Fix: check them (restore --dry-run), then \`omarchy-backup integrity record <name>\`, or let retention replace them."
+    else
+      ob_doctor_check "Destination integrity" "OK"
+    fi
+  fi
+
+  # Signatures: a key to sign with, and a trust anchor that knows it.
+  local sig_key sig_problem=""
+  if ! sig_key="$(ob_sig_key)"; then
+    sig_problem="no signing key configured (OB_CFG_SIGNING_KEY) -- snapshots are unsigned, so a restore cannot tell a genuine snapshot from a forged one"
+  elif [ ! -r "$sig_key" ]; then
+    sig_problem="signing key $sig_key is not readable"
+  elif [ "$(stat -c %a -- "$sig_key" 2>/dev/null)" != 600 ]; then
+    sig_problem="signing key $sig_key must have mode 0600 (is $(stat -c %a -- "$sig_key" 2>/dev/null))"
+  else
+    local sig_pub sig_allowed sig_anchor_rc
+    sig_pub="$(ssh-keygen -y -f "$sig_key" </dev/null 2>/dev/null | awk '{print $1" "$2}')"
+    sig_allowed="$(mktemp)"
+    ob_sig_build_allowed "$sig_allowed"; sig_anchor_rc=$?
+    if [ -z "$sig_pub" ]; then
+      sig_problem="cannot read the public part of $sig_key (passphrase? the nightly run cannot sign with it)"
+    elif [ "$sig_anchor_rc" -eq 1 ]; then
+      sig_problem="no trust anchor configured (OB_CFG_SIGNER_GITHUB or OB_CFG_ALLOWED_SIGNERS) -- a fresh install could not verify anything"
+    elif [ "$sig_anchor_rc" -ne 0 ]; then
+      sig_problem="trust anchor unusable: $OB_SIG_ANCHOR"
+    elif ! grep -qF -- "$sig_pub" "$sig_allowed"; then
+      sig_problem="the signing key is not among the keys of $OB_SIG_ANCHOR -- signatures would not verify"
+    fi
+    rm -f -- "$sig_allowed"
+  fi
+  if [ -z "$sig_problem" ]; then
+    ob_doctor_check "Snapshot signatures" "OK"
+  else
+    ob_doctor_check "Snapshot signatures" "WARN" "$sig_problem -- Fix: see README, \"Never trust the destination\" (ssh-keygen -t ed25519 -N '' -f ~/.config/omarchy-backup/signing_key; gh ssh-key add --type signing; config set OB_CFG_SIGNING_KEY / OB_CFG_SIGNER_GITHUB)."
   fi
 
   # Restore plausibility: the commands restore.sh relies on still exist
@@ -282,6 +332,12 @@ ob_doctor_run() {
   # --- print report ---
   printf '%s\n' "${OB_DOCTOR_LINES[@]}"
   echo
+  local repo_modes; repo_modes="$(ob_repo_modes_report)"
+  if [ -n "$repo_modes" ]; then
+    echo "Git history in snapshots:"
+    printf '%s\n' "$repo_modes"
+    echo
+  fi
   if [ "${#OB_DOCTOR_WARN[@]}" -gt 0 ]; then
     echo "WARN:"
     printf '  %s\n' "${OB_DOCTOR_WARN[@]}"

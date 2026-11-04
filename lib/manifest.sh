@@ -49,6 +49,12 @@ ob_resolve_consider_file() {
   if ob_matches_any_glob "$f" "${OB_EXCLUDES[@]}"; then
     return 0
   fi
+  # The configured signing key, whatever it is called, never leaves this
+  # machine (a snapshot carrying it would let anyone forge signatures).
+  if [ -n "${OB_CFG_SIGNING_KEY:-}" ] && [ "$f" -ef "$(ob_expand_path "$OB_CFG_SIGNING_KEY")" ]; then
+    OB_SKIPPED_SECRET+=("$f")
+    return 0
+  fi
   if ob_matches_any_glob "$f" "${OB_SECRET_GLOBS[@]}"; then
     OB_SKIPPED_SECRET+=("$f")
     return 0

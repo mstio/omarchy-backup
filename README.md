@@ -52,20 +52,37 @@ Handled separately, not via `paths.conf`:
 - **Your own git checkouts** (`repo <path>` lines in `paths.d/`, e.g. a
   tool that `~/.local/bin` symlinks into): recorded as `{remote, branch,
   commit, tracked diff}` and re-cloned on restore (step 4). Every snapshot
-  also carries an embedded copy of the tracked files and the **full
-  history** as a `git bundle` (all branches, tags and remote-tracking refs),
-  so a repo **without any remote**, or with commits the remote never got,
-  comes back complete. Untracked files are not included; snapshots warn
-  about them. A glob declares every git checkout it matches, so new
-  projects need no extra line (non-git folders are skipped):
+  also carries an embedded copy of the tracked files and a `git bundle`
+  with as much history as a restore could otherwise lose:
+
+  | Repo | Bundle in the snapshot |
+  |---|---|
+  | no `origin` remote | **full history** (all branches, tags, stash) |
+  | `repo <path> full` | **full history**, even though a remote has it |
+  | with `origin`, something not pushed | **missing commits only**: unpushed commits on any branch, plus annotated tags (no `git stash`) |
+  | with `origin`, everything pushed | none -- **metadata only** (remote, commit, diff; no `git stash`) |
+
+  Local branches and lightweight tags that point at already pushed commits
+  are recorded by name in the manifest and recreated after the clone.
+  Untracked files are not included; snapshots warn about them. A glob
+  declares every git checkout it matches, so new projects need no extra
+  line (non-git folders are skipped); `full` works with globs too:
 
   ```
   # ~/.config/omarchy-backup/paths.d/local-repos.conf
   repo ~/Projects/my-tool
+  repo ~/Projects/important full
   repo ~/Work/*
   ```
 
-  The bundle holds the **whole** history, including anything ever
+  `full` is the trailing word of the line (a path itself ending in
+  " full" cannot be declared). `omarchy-backup status` and `doctor` list
+  per repo what the next snapshot carries ("full history", "missing
+  commits only (N)", "metadata only"). Without `full`, the remote is the
+  only complete copy of a pushed repo's history: if it disappears or is
+  force-pushed, a restore gets the files but not the history.
+
+  A full bundle holds the **whole** history, including anything ever
   committed and later deleted (a password, a key) and `git stash` entries,
   and it travels to your remote destination with every snapshot. If that is
   not wanted, add `exclude *.bundle` (all repos) or
@@ -107,8 +124,11 @@ omarchy-backup baseline <name>                    # mark an existing snapshot as
 omarchy-backup status                             # GREEN / YELLOW / RED vs. the baseline
 omarchy-backup push <name>                         # upload a snapshot to the configured rclone remote
 omarchy-backup remote-list                         # list snapshots available on the remote
-omarchy-backup pull <name>                         # download a snapshot from the remote
+omarchy-backup pull <name> [--signer-github U]     # download a snapshot from the remote (signature checked)
 omarchy-backup restore <name> [--dry-run]          # pulls from remote automatically if not local
+        [--signer-github U | --allowed-signers F] [--accept-unverified] [--yes] [--repos-from-snapshot]
+omarchy-backup import <folder> [--signer-github U] # a snapshot folder downloaded by hand
+omarchy-backup integrity check|record <name>|forget <name>|reset   # the destination vs. this machine's ledger
 omarchy-backup doctor                              # compatibility / "decay" check
 omarchy-backup timers install|status|uninstall     # systemd --user timers for automatic snapshot+doctor
 omarchy-backup config list|get <KEY>|set <KEY> <VALUE>   # read/write config.conf safely (used by the bar widget)
@@ -310,6 +330,139 @@ for both destination modes:
 Index reads are retried briefly, because caching mounts can serve stale or
 zero-filled content right after the index was replaced.
 
+## Never trust the destination
+
+Whoever can write to the backup destination (a shared cloud folder, a
+compromised account, another device syncing it) could replace a snapshot
+and recompute every checksum inside it. A restore then writes and runs that
+content: scripts in `~/.local/bin`, systemd units, hooks, agent
+instructions. So the destination and everything in a snapshot are treated
+as untrusted, with three independent layers:
+
+**1. Integrity ledger (this machine).** After every verified upload the
+files this machine just wrote -- and only those, each checked against the
+local copy -- are recorded in
+`~/.local/share/omarchy-backup/integrity-ledger.json` (never uploaded): with
+the backend's own MD5 where it offers one without downloading
+(`rclone lsjson --hash`, e.g. Google Drive), else size and modification
+time (listed in UTC, so DST or time zone changes are no "change"). The
+ledger is never re-baselined from what the destination shows: a file
+nobody recorded stays a problem. Every automatic run and `doctor` compare the destination
+with it. A changed, added or removed file of a known snapshot -- or an
+unknown snapshot folder -- raises a critical desktop notification, turns
+`status` (and the widget) RED and makes `doctor` FAIL with the exact files.
+The local backup itself keeps running, but nothing is uploaded to (or
+recorded from) a destination with unresolved problems. The notification
+comes once per new set of problems; `status`/`doctor` stay red until it is
+resolved. `pull` downloads into a private staging folder, never replaces an
+existing local snapshot, and refuses content that differs from what this
+machine uploaded.
+
+Resolving: look at the files `doctor` names, delete what is not yours on
+the destination, then `omarchy-backup integrity forget <name>` for a
+snapshot you deleted, or -- after a full cleanup -- `omarchy-backup
+integrity reset` (the next push records the destination anew).
+
+- Destination is an rclone remote (`OB_CFG_REMOTE_NAME`): MD5 from the
+  backend, no download.
+- Destination is a mounted cloud folder (rclone mount, FUSE): hashing it
+  would download every file, so only size + date are compared, and `doctor`
+  says so. Set `OB_CFG_INTEGRITY_RCLONE_REMOTE` to the same folder as an
+  rclone spec (e.g. `mydrive:backups/omarchy` when `mydrive:` is the
+  mounted remote) to get the MD5 check.
+- Plain local disk/NAS folder: hashed locally.
+- Uploads from before the ledger existed are listed by `doctor`; after
+  checking one (`restore --dry-run` with signature verification), adopt it
+  with `omarchy-backup integrity record <name>`: with a local copy only its
+  four files are adopted, and only if the destination's match it (anything
+  else there stays a problem); without a local copy it needs `--yes` and
+  says what it trusts. A snapshot uploaded *after* the ledger existed but
+  missing from it is a problem, never "unrecorded".
+- An upload whose destination listing does not match what was just sent
+  counts as failed (not marked uploaded, alert, retried by the next run).
+- A folder named after a local snapshot newer than the last successful
+  upload is that snapshot's unfinished upload (the retry overwrites it and
+  records only its own files); any other unknown folder is a problem.
+- `omarchy-backup integrity check` runs the comparison on demand.
+
+The ledger's trust ends with this machine. After a reinstall, layer 2
+takes over.
+
+**2. Signatures.** Every snapshot's `manifest.json` (which holds the
+payload's and `checksums.sha256`'s SHA-256) is signed with an SSH key
+(`ssh-keygen -Y sign`, namespace `omarchy-backup`; no new dependency) and
+uploaded as `manifest.json.sig`; so are the tool copy
+(`omarchy-backup-tool.tar.gz.sig`) and `RECOVERY.md.sig`. The trust anchor never comes from the
+backup: your GitHub account's public **signing** keys
+(`OB_CFG_SIGNER_GITHUB`, or `--signer-github <user>` on a fresh install)
+and/or a local file of trusted public keys (`OB_CFG_ALLOWED_SIGNERS`,
+`--allowed-signers <file>`). `restore`, `import` and `pull` verify first:
+a valid signature is reported with the key's fingerprint; an invalid,
+missing or unverifiable one gives a loud warning and continues only after an
+explicit "yes" -- or `--accept-unverified` in a non-interactive run. The
+decision stays yours; it is never silent. `doctor` warns while no key is
+configured or GitHub does not list it.
+
+One-time setup (the nightly run is non-interactive, so the key has no
+passphrase; it is never put into a snapshot, whatever it is called):
+
+```
+ssh-keygen -t ed25519 -N '' -C omarchy-backup -f ~/.config/omarchy-backup/signing_key
+gh auth refresh -h github.com -s admin:ssh_signing_key
+gh ssh-key add ~/.config/omarchy-backup/signing_key.pub --type signing --title omarchy-backup
+omarchy-backup config set OB_CFG_SIGNING_KEY ~/.config/omarchy-backup/signing_key
+omarchy-backup config set OB_CFG_SIGNER_GITHUB <your-github-user>
+omarchy-backup doctor        # "Snapshot signatures  OK"
+```
+
+Before unpacking the tool copy on a fresh machine (no tool installed yet),
+check it by hand against your GitHub signing keys:
+
+```
+curl -s https://api.github.com/users/<you>/ssh_signing_keys | jq -r '.[].key' \
+  | sed 's/^/backup-signer namespaces="omarchy-backup" /' > allowed
+ssh-keygen -Y verify -f allowed -I backup-signer -n omarchy-backup \
+  -s omarchy-backup-tool.tar.gz.sig < omarchy-backup-tool.tar.gz
+```
+
+("Good ... signature" = genuine; the same works for `RECOVERY.md`.)
+
+If the key is lost, snapshots signed with it still verify as long as the
+public key stays on GitHub; if it leaks, delete it there -- every snapshot
+it signed then stops verifying.
+
+**3. Restore review.** The payload is copied once into a private folder
+under the data dir, checked and unpacked there (size-capped), and that one
+tree is reviewed and restored -- nothing can swap the archive in between.
+Before anything is written, `restore` lists **every** file it would add or
+change, per folder with counts, and shows each one -- an excerpt for new
+files, a diff for changed ones -- except pure data (images, fonts). On a
+fresh install that is everything, on purpose: a theme, a terminal config or
+`mimeapps.list` can run code as well as a script can. Then come the
+packages it would install (AUR ones are built from source), the systemd
+units it would enable/start, and the plugins and repos it would fetch.
+Package and unit names from the snapshot that are not valid names are
+ignored and reported. Code and configuration (scripts, units, hooks,
+plugins, themes, Hyprland/terminal/shell/editor config, autostart and
+`.desktop` entries, git/ssh/gpg/gh config, agent files, `mimeapps.list`,
+...) is shown in full up to 200 lines per file, other files as an 8-line
+excerpt. The complete review always goes to
+`~/.local/share/omarchy-backup/restore-review-<name>-<time>.txt`; on a
+terminal a long one opens in `$PAGER` (default `less -R`). It then asks; a
+non-interactive run needs `--yes`. `--dry-run` shows the same.
+
+The unpacked payload may be at most 50x its compressed size (at least
+64 MB, at most `OB_RESTORE_MAX_UNPACKED_MB`, default 1024). A local
+snapshot folder without `manifest.json` (an interrupted download) is moved
+aside as `<name>.stale-<time>` before the restore downloads it again;
+staging leftovers older than a day are cleaned up.
+
+The snapshot's own `~/.config/omarchy-backup/config.conf` is sourced as
+code and holds the trust settings, so it is never activated by a restore:
+it is written as `config.conf.restored` (its full diff is in the review);
+adopt it with `mv ~/.config/omarchy-backup/config.conf.restored
+~/.config/omarchy-backup/config.conf` after reading it.
+
 ## Restore (fresh Omarchy install -> your workspace)
 
 ```
@@ -320,9 +473,14 @@ Fresh Omarchy install
   -> ./install.sh
   -> edit ~/.config/omarchy-backup/config.conf (set OB_CFG_REMOTE_NAME)
   -> omarchy-backup remote-list          # see what's available
-  -> omarchy-backup restore <name> --dry-run   # review the plan first
-  -> omarchy-backup restore <name>
+  -> omarchy-backup restore <name> --dry-run --signer-github <you>   # review the plan first
+  -> omarchy-backup restore <name> --signer-github <you>
 ```
+
+The restore first checks the snapshot's signature against your GitHub
+signing keys (or `--allowed-signers <file>`), then lists the content that
+runs as code and asks before writing it; see "Never trust the destination"
+below.
 
 **Without git or rclone**: every push also leaves a copy of this tool
 (`omarchy-backup-tool.tar.gz`) and your recovery notes (`RECOVERY.md`, see
@@ -331,18 +489,23 @@ download both plus a snapshot folder from the destination in a browser, then:
 
 ```
 tar -xzf omarchy-backup-tool.tar.gz -C ~/Projects && ~/Projects/omarchy-backup/install.sh
-omarchy-backup import ~/Downloads/<snapshot-folder>
-omarchy-backup restore <name> --dry-run --repos-from-snapshot
-omarchy-backup restore <name> --repos-from-snapshot
+omarchy-backup import ~/Downloads/<snapshot-folder> --signer-github <you>
+omarchy-backup restore <name> --dry-run --repos-from-snapshot --signer-github <you>
+omarchy-backup restore <name> --repos-from-snapshot --signer-github <you>
 ```
+
+The tool copy itself comes from the destination too: check it before
+running it (the integrity ledger on the old machine, if it still exists,
+lists its MD5; otherwise prefer a fresh clone from GitHub).
 
 Note: snapshots are stored per hostname (`<destination>/<hostname>/`), so
 give the fresh install the same hostname (or `hostnamectl set-hostname`)
 before `remote-list`. The destination does not have to be mounted yet: point
 `OB_CFG_REMOTE_NAME`/`OB_CFG_REMOTE_PATH` at the rclone remote for the
-restore; your own `config.conf` and `paths.d/` come back with the payload
-(the temporary one is kept as `config.conf.bak.<timestamp>`), together with
-the units that mount the destination again.
+restore; your own `paths.d/` comes back with the payload, your
+`config.conf` as `config.conf.restored` (adopt it after reading it, see
+"Never trust the destination"), together with the units that mount the
+destination again.
 
 Note: any plugin the manifest lists as git-managed (`plugins.git_managed` --
 this includes not just third-party plugins but your own, once you `git
@@ -380,17 +543,19 @@ as a manual step at the end rather than failing the whole restore.
    survives); otherwise the snapshot commit is checked out detached, and a
    commit the remote never received is reported. Tracked uncommitted edits
    are reapplied; commits, branches and tags the remote never received are
-   added from the snapshot's history bundle (a branch tip the remote moved
-   past is never moved back). An existing directory is never touched. Private repos need
+   added from the snapshot's history bundle and the recorded local refs (a
+   branch tip the remote moved past is never moved back). An existing directory is never touched. Private repos need
    `gh auth login && gh auth setup-git` first; otherwise the clone is listed
    as a manual step and the restore can simply be re-run later. **Without
    a usable remote** (none recorded, no GitHub login, no network, or
-   `restore --repos-from-snapshot`) the repo is rebuilt from the snapshot's
+   `restore --repos-from-snapshot`) the repo is rebuilt from a **full**
    history bundle: all branches and tags, `origin` set to the recorded
    remote if there was one, the recorded branch checked out and tracked
-   uncommitted edits reapplied. Only if there is no bundle (older
-   snapshots, a repo larger than `OB_CFG_MAX_FILE_SIZE_MB`) or git is
-   missing, the file-only copy is unpacked instead (tracked files with
+   uncommitted edits reapplied. A "missing commits only" bundle cannot do
+   that (it builds on the remote's commits), and neither can a repo with
+   no bundle, an older snapshot's oversized bundle or a machine without
+   git: then the file-only copy is unpacked instead, and the restore says
+   that `repo <path> full` would have kept the history (tracked files with
    uncommitted edits, no history); the restore then prints the commands to
    reconnect it to git later. Both live under
    `~/.local/share/omarchy-backup/repo-sources/`.

@@ -74,6 +74,10 @@ OB_CFG_RETENTION_REMOTE=3
 OB_CFG_MAX_FILE_SIZE_MB=20
 OB_CFG_SKIP_AUTO_IF_CLEAN="true"
 OB_CFG_REPO_SCAN_ROOTS="~/Projects ~/Work"  # doctor looks for unprotected git repos here
+OB_CFG_INTEGRITY_RCLONE_REMOTE=""   # rclone spec of a mounted destination, for hash checks without download
+OB_CFG_SIGNING_KEY=""               # private SSH key that signs every snapshot manifest
+OB_CFG_SIGNER_GITHUB=""             # GitHub user whose public signing keys verify snapshots
+OB_CFG_ALLOWED_SIGNERS=""           # or: local file with trusted public keys
 
 ob_load_config() {
   if [ -f "$OB_CONFIG_FILE" ]; then
@@ -133,6 +137,28 @@ OB_CFG_RECOVERY_NOTES=
 # `repo`). Included folders are always checked as well. Never crosses into
 # other filesystems (cloud mounts are skipped).
 OB_CFG_REPO_SCAN_ROOTS="~/Projects ~/Work"
+
+# --- Integrity of the backup destination (see README, "Never trust the
+# destination"). Everything on the destination is treated as untrusted.
+
+# If OB_CFG_REMOTE_PATH is a mounted cloud folder (rclone mount = FUSE), the
+# same folder as an rclone spec lets every check compare the backend's own
+# MD5 hashes without downloading anything, e.g.
+#   OB_CFG_INTEGRITY_RCLONE_REMOTE="mydrive:backups/omarchy"
+# Empty: a FUSE destination is only checked by size + modification time.
+OB_CFG_INTEGRITY_RCLONE_REMOTE=
+
+# Private SSH key that signs every snapshot's manifest.json (ssh-keygen -Y
+# sign). The nightly run is non-interactive, so use a dedicated key without
+# passphrase, mode 0600, e.g. ~/.config/omarchy-backup/signing_key. It is
+# never put into a snapshot.
+OB_CFG_SIGNING_KEY=
+
+# Trust anchor for verifying signatures -- never taken from the backup:
+# the public SSH *signing* keys of this GitHub account, and/or a local file
+# with trusted public keys (one per line).
+OB_CFG_SIGNER_GITHUB=
+OB_CFG_ALLOWED_SIGNERS=
 EOF
   ob_info "Wrote default config: $OB_CONFIG_FILE"
 }
@@ -170,6 +196,8 @@ ob_read_path_rules() {
   OB_INCLUDES=()
   OB_EXCLUDES=()
   OB_REPOS=()
+  # `repo <path> full`: bundle the whole history even with a remote.
+  declare -gA OB_REPO_FULL=()
   local f line kind val
   while IFS= read -r f; do
     [ -z "$f" ] && continue
@@ -190,6 +218,11 @@ ob_read_path_rules() {
         # A glob (`repo ~/Work/*`) picks up every git checkout it matches,
         # so new projects need no extra line; non-git matches are skipped.
         repo)
+          # Trailing word `full` (exactly) = opt-in full history bundle.
+          local full=false
+          if [[ "$val" =~ ^(.*[^[:space:]])[[:space:]]+full$ ]]; then
+            val="${BASH_REMATCH[1]}"; full=true
+          fi
           val="${val%/}"
           case "$val" in
             *[\*?[]*)
@@ -197,10 +230,15 @@ ob_read_path_rules() {
               local m oldifs="$IFS"
               IFS=$'\n'
               for m in $val; do
-                [ -d "$m/.git" ] && OB_REPOS+=("${m%/}")
+                if [ -d "$m/.git" ]; then
+                  OB_REPOS+=("${m%/}")
+                  [ "$full" = true ] && OB_REPO_FULL["${m%/}"]=1
+                fi
               done
               IFS="$oldifs" ;;
-            *) OB_REPOS+=("$val") ;;
+            *)
+              OB_REPOS+=("$val")
+              [ "$full" = true ] && OB_REPO_FULL["$val"]=1 ;;
           esac ;;
       esac
     done < "$f"
@@ -211,7 +249,7 @@ ob_read_path_rules() {
 OB_SECRET_GLOBS=(
   "*.credentials.json" "credentials.json" "auth.json" "oauth_creds*.json"
   "*token*" "*secret*" "*.key" "*.pem" "id_rsa*" "id_ed25519*" "id_ecdsa*"
-  ".netrc" "*.p12" "*.pfx" "shadow" "gshadow"
+  ".netrc" "*.p12" "*.pfx" "shadow" "gshadow" "signing_key" "signing_key.*" "*_signing_key"
 )
 
 ob_matches_any_glob() {

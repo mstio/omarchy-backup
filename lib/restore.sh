@@ -49,7 +49,14 @@ ob_restore_run() {
   ob_read_path_rules
   ob_state_init_if_missing
 
+  ob_sweep_stale_staging
   local dir="$OB_SNAPSHOTS_DIR/$name"
+  if [ ! -f "$dir/manifest.json" ] && { [ -e "$dir" ] || [ -L "$dir" ]; }; then
+    # An interrupted earlier attempt: keep it, but out of the way.
+    local stale; stale="$dir.stale-$(date '+%Y%m%d-%H%M%S')"
+    mv -- "$dir" "$stale" || ob_die "Local '$name' is incomplete (no manifest.json) and could not be moved aside."
+    ob_warn "Local '$name' had no manifest.json (interrupted download?); moved aside to $stale."
+  fi
   if [ ! -f "$dir/manifest.json" ]; then
     if ob_remote_configured; then
       ob_info "Snapshot '$name' not found locally; trying remote..."
@@ -59,17 +66,33 @@ ob_restore_run() {
     fi
   fi
 
-  local manifest; manifest="$(jq . "$dir/manifest.json")"
+  # Never trust the input: the signature (trust anchor from this machine's
+  # config or the command line, never from the snapshot) comes first.
+  ob_sig_gate "$dir" "the restore" || exit 1
+
+  local manifest; manifest="$(jq . "$dir/manifest.json")" || ob_die "manifest.json of '$name' is not valid JSON."
   ob_info "Restoring snapshot '$name' (created $(echo "$manifest" | jq -r .created_at), Omarchy $(echo "$manifest" | jq -r .omarchy_version))"
 
-  # --- integrity: payload checksum ---
+  # --- integrity: payload checksum, on a private copy ---
+  # The payload is copied once into a 0700 folder under the data dir, checked
+  # there and unpacked there (size-capped); review and restore both use that
+  # one tree, so nothing can swap the archive between check and use.
+  OB_RESTORE_STAGE="$(mktemp -d "$OB_DATA_DIR/.restore-stage.XXXXXX")" || ob_die "Could not create a staging folder."
+  chmod 700 -- "$OB_RESTORE_STAGE"
+  trap 'rm -rf -- "${OB_RESTORE_STAGE:?}"' EXIT
+  cp -- "$dir/payload.tar.zst" "$OB_RESTORE_STAGE/payload.tar.zst" || ob_die "Could not copy the payload."
   local stored_sha actual_sha
   stored_sha="$(echo "$manifest" | jq -r .payload.sha256)"
-  actual_sha="$(sha256sum -- "$dir/payload.tar.zst" | awk '{print $1}')"
+  actual_sha="$(sha256sum -- "$OB_RESTORE_STAGE/payload.tar.zst" | awk '{print $1}')"
   if [ "$stored_sha" != "$actual_sha" ]; then
     ob_die "Payload checksum mismatch for '$name' -- archive is corrupt, aborting restore."
   fi
   ob_info "Payload integrity OK."
+  ob_restore_unpack "$OB_RESTORE_STAGE" "$manifest" || exit 1
+  OB_RESTORE_TREE="$OB_RESTORE_STAGE/tree"
+
+  # Before anything is written: everything new or changed, in full.
+  ob_restore_review "$OB_RESTORE_TREE" "$manifest" || exit 1
 
   local current_omarchy; current_omarchy="$(ob_inv_omarchy_version)"
   local snap_omarchy; snap_omarchy="$(echo "$manifest" | jq -r .omarchy_version)"
@@ -87,9 +110,9 @@ ob_restore_run() {
 
   echo
   echo "== 3/8 Scripts, dotfiles, themes, agent config, machine memory =="
-  ob_restore_payload "$dir"
+  ob_restore_payload "$OB_RESTORE_TREE"
   # Tools pinned via mise (agent CLIs, gh, node) are listed, not embedded.
-  if tar --zstd -tf "$dir/payload.tar.zst" 2>/dev/null | grep -qE '^(\./)?\.config/mise/config\.toml$'; then
+  if [ -f "$OB_RESTORE_TREE/.config/mise/config.toml" ]; then
     ob_restore_note "Install the tools pinned in ~/.config/mise/config.toml: mise install"
   fi
 
@@ -132,35 +155,32 @@ ob_restore_run() {
 }
 
 ob_restore_packages() {
-  local manifest="$1"
-  local want_native want_aur have
-  want_native="$(echo "$manifest" | jq -r '.packages.pacman_explicit[]' 2>/dev/null)"
-  want_aur="$(echo "$manifest" | jq -r '.packages.aur_foreign[]' 2>/dev/null)"
-  have="$(pacman -Qq 2>/dev/null | sort -u)"
+  local manifest="$1" line
+  local -a native=() aur=()
+  while IFS= read -r line; do
+    case "$line" in
+      "native "*) native+=("${line#native }") ;;
+      "aur "*) aur+=("${line#aur }") ;;
+      "invalid "*) ob_restore_note "Ignored a package name from the snapshot that is not a valid package name: $(printf '%q' "${line#invalid }")" ;;
+    esac
+  done < <(ob_restore_missing_packages "$manifest")
 
-  local missing_native missing_aur
-  missing_native="$(comm -23 <(echo "$want_native" | sort -u) <(echo "$have"))"
-  missing_aur="$(comm -23 <(echo "$want_aur" | sort -u) <(echo "$have"))"
-
-  if [ -n "$missing_native" ]; then
-    # shellcheck disable=SC2086
+  if [ "${#native[@]}" -gt 0 ]; then
     ob_restore_run_step "install missing native packages" \
-      sudo pacman -S --needed --noconfirm $missing_native
+      sudo pacman -S --needed --noconfirm -- "${native[@]}"
   else
     echo "  No missing native packages."
   fi
 
-  if [ -n "$missing_aur" ]; then
+  if [ "${#aur[@]}" -gt 0 ]; then
     if ob_require_tool yay; then
-      # shellcheck disable=SC2086
       ob_restore_run_step "install missing AUR packages via yay" \
-        yay -S --needed --noconfirm $missing_aur
+        yay -S --needed --noconfirm "${aur[@]}"
     elif ob_require_tool paru; then
-      # shellcheck disable=SC2086
       ob_restore_run_step "install missing AUR packages via paru" \
-        paru -S --needed --noconfirm $missing_aur
+        paru -S --needed --noconfirm "${aur[@]}"
     else
-      ob_restore_note "No AUR helper (yay/paru) found -- install these AUR packages manually: $(echo "$missing_aur" | tr '\n' ' ')"
+      ob_restore_note "No AUR helper (yay/paru) found -- install these AUR packages manually: ${aur[*]}"
     fi
   else
     echo "  No missing AUR packages."
@@ -415,13 +435,16 @@ ob_restore_repo_from_bundle() {
   local target="$HOME/$rel" src stage
   [ -n "$bun" ] && [[ "$bun" == .local/share/omarchy-backup/repo-sources/*.bundle ]] \
     && ob_restore_repo_path_valid "$bun" || return 1
+  # $bkind comes from ob_restore_repos. A delta bundle needs the commits the
+  # remote has as its base; without the remote it cannot rebuild anything.
+  if [ "${bkind:-full}" != full ]; then
+    ob_restore_note "Repo ~/$rel: the snapshot only holds the commits its remote lacked (no \`full\` on its repo line); without that remote they cannot rebuild the history, so only the files come back. \`repo ~/$rel full\` avoids this."
+    return 1
+  fi
   ob_require_tool git || return 1
   if [ "$OB_DRY_RUN" = "true" ]; then
     # Step 3 did not write the payload; the bundle is still inside it.
-    if [ -n "$sdir" ] && [ -z "${OB_RESTORE_PAYLOAD_LIST+x}" ]; then
-      OB_RESTORE_PAYLOAD_LIST="$(zstd -q -d -c "$sdir/payload.tar.zst" 2>/dev/null | tar -t 2>/dev/null)"
-    fi
-    if printf '%s\n' "${OB_RESTORE_PAYLOAD_LIST:-}" | grep -qxF -- "$bun"; then
+    if [ -n "${OB_RESTORE_TREE:-}" ] && [ -f "$OB_RESTORE_TREE/$bun" ]; then
       echo "  [dry-run] $reason -> rebuild ~/$rel from the snapshot's history bundle (all branches and tags)"
       return 0
     fi
@@ -501,7 +524,7 @@ ob_restore_merge_bundle() {
   src="$HOME/$bun"
   [ -f "$src" ] || return 0
   git -C "$stage" bundle verify -q -- "$src" >/dev/null 2>&1 || {
-    ob_restore_note "Repo ~/$rel: the snapshot's history bundle could not be read; unpushed work from it was not merged."
+    ob_restore_note "Repo ~/$rel: the snapshot's history bundle could not be read (or the commits it builds on are no longer at the remote); unpushed work from it was not merged."
     return 0
   }
   # Non-forced: an existing tag with different content is kept (rejected).
@@ -529,6 +552,35 @@ ob_restore_merge_bundle() {
   done < <(git -C "$stage" for-each-ref --format='%(refname)' refs/ob-snapshot/heads/)
   git -C "$stage" for-each-ref --format='delete %(refname)' refs/ob-snapshot/ | git -C "$stage" update-ref --stdin 2>/dev/null
   return 0
+}
+
+ob_restore_local_refs() {
+  # ob_restore_local_refs <stage> <rel>   (reads $lrefs from ob_restore_repos)
+  # Local branches and tags the remote does not have but whose objects are
+  # there (e.g. a lightweight tag on a pushed commit) -- a delta bundle
+  # cannot carry such refs, the manifest's `local_refs` does.
+  local stage="$1" rel="$2" ref sha name
+  [ -n "${lrefs:-}" ] && [ "$lrefs" != "[]" ] || return 0
+  while IFS=$'\t' read -r ref sha; do
+    [[ "$sha" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || continue
+    case "$ref" in refs/heads/*|refs/tags/*) ;; *) continue ;; esac
+    git check-ref-format "$ref" 2>/dev/null || continue
+    git -C "$stage" show-ref --verify --quiet "$ref" && continue
+    case "$ref" in
+      refs/heads/*)
+        name="${ref#refs/heads/}"
+        # Already contained in the remote's branch: nothing local to restore.
+        git -C "$stage" show-ref --verify --quiet "refs/remotes/origin/$name" \
+          && git -C "$stage" merge-base --is-ancestor "$sha" "refs/remotes/origin/$name" 2>/dev/null \
+          && continue ;;
+    esac
+    if ! git -C "$stage" cat-file -e "$sha" 2>/dev/null; then
+      ob_restore_note "Repo ~/$rel: ${ref#refs/} could not be restored (${sha:0:12} is neither at the remote nor in the snapshot)."
+      continue
+    fi
+    git -C "$stage" update-ref "$ref" "$sha" "" 2>/dev/null || continue
+    echo "  ~/$rel: restored local ${ref#refs/} from the snapshot."
+  done < <(printf '%s' "$lrefs" | jq -r '.[]? | [.ref, .sha] | @tsv' 2>/dev/null)
 }
 
 # Snapshot fallback chain: history bundle first (needs git), then the
@@ -566,6 +618,11 @@ ob_restore_repos() {
     untracked="$(echo "$e" | jq -r '.untracked // 0')"
     local arc; arc="$(echo "$e" | jq -r '.source_archive // ""')"
     local bun; bun="$(echo "$e" | jq -r '.history_bundle // ""')"
+    # Read by ob_restore_repo_from_bundle / ob_restore_local_refs (dynamic
+    # scope). Snapshots before the delta mode only had full bundles.
+    local bkind; bkind="$(echo "$e" | jq -r '.history_bundle_kind // ""')"
+    case "$bkind" in full|delta) ;; *) bkind=full ;; esac
+    local lrefs; lrefs="$(echo "$e" | jq -c '.local_refs // []')"
     if ! ob_restore_repo_path_valid "$rel"; then
       ob_restore_note "Snapshot lists a repo with an unsafe path ($(printf '%q' "$rel")); ignored -- review the manifest manually."
       continue
@@ -623,6 +680,7 @@ ob_restore_repos() {
       git -C "$stage" checkout --quiet "$branch" 2>/dev/null || true
     fi
     ob_restore_merge_bundle "$stage" "$bun" "$rel"
+    ob_restore_local_refs "$stage" "$rel"
     # The recorded branch may exist only now (unpublished, from the bundle).
     if [ -n "$branch" ] && [ "$(git -C "$stage" symbolic-ref --quiet --short HEAD 2>/dev/null)" != "$branch" ]; then
       if git -C "$stage" show-ref --verify --quiet "refs/heads/$branch"; then
@@ -663,15 +721,53 @@ ob_restore_repos() {
   done <<< "$entries"
 }
 
-ob_restore_payload() {
-  local dir="$1"
-  local tmp; tmp="$(mktemp -d)"
-  zstd -q -d -c "$dir/payload.tar.zst" | tar -x -C "$tmp"
+# Unpacks <stage>/payload.tar.zst into <stage>/tree, refusing an archive
+# that unpacks to more than 50x its compressed size (at least 64 MB, at most
+# OB_RESTORE_MAX_UNPACKED_MB, default 1024). GNU tar drops absolute and `..`
+# member names and delays symlinks, so nothing lands outside the tree.
+ob_restore_unpack() {  # <stage> <manifest json>
+  local stage="$1" manifest="$2" packed limit_mb limit size cap="${OB_RESTORE_MAX_UNPACKED_MB:-1024}"
+  packed="$(stat -c %s -- "$stage/payload.tar.zst" 2>/dev/null || echo 0)"
+  # 50x: text/JSON compressed with zstd -19 can exceed 20x (second opinion).
+  limit_mb=$(( packed * 50 / 1024 / 1024 ))
+  [ "$limit_mb" -ge 64 ] || limit_mb=64
+  [[ "$cap" =~ ^[0-9]+$ ]] || cap=1024
+  [ "$limit_mb" -le "$cap" ] || limit_mb="$cap"
+  limit=$(( limit_mb * 1024 * 1024 ))
+  zstd -q -d -c "$stage/payload.tar.zst" 2>/dev/null | head -c "$((limit + 1))" > "$stage/payload.tar"
+  size="$(stat -c %s -- "$stage/payload.tar" 2>/dev/null || echo 0)"
+  if [ "$size" -gt "$limit" ]; then
+    ob_err "The payload unpacks to more than ${limit_mb} MB; refusing (corrupt or hostile snapshot)."
+    return 1
+  fi
+  mkdir -m 700 -- "$stage/tree" || return 1
+  if ! tar -x -f "$stage/payload.tar" -C "$stage/tree" --no-same-owner --no-same-permissions 2>/dev/null; then
+    ob_err "Could not unpack the payload."
+    return 1
+  fi
+  rm -f -- "$stage/payload.tar"
+}
 
+# The tool's own config is bash-sourced and holds the trust anchor
+# (signer, allowed signers, signing key, integrity remote): a restored copy
+# never replaces the active one; it is written next to it for review.
+OB_RESTORE_HELD_BACK=".config/omarchy-backup/config.conf"
+
+ob_restore_payload() {
+  local tree="$1"
   local f rel target
   while IFS= read -r -d '' f; do
-    rel="${f#"$tmp"/}"
+    rel="${f#"$tree"/}"
     target="$HOME/$rel"
+    if [ "$rel" = "$OB_RESTORE_HELD_BACK" ] && ! cmp -s -- "$f" "$target" 2>/dev/null; then
+      if [ "$OB_DRY_RUN" = "true" ]; then
+        echo "  [dry-run] would write $target.restored (active config.conf is kept)"
+      else
+        cp -a -- "$f" "$target.restored"
+      fi
+      ob_restore_note "The snapshot's ~/$rel was written as ~/$rel.restored and is NOT active (it is sourced as code and holds the trust settings). Compare: diff ~/$rel ~/$rel.restored -- adopt: mv ~/$rel.restored ~/$rel"
+      continue
+    fi
     if [ -e "$target" ] || [ -L "$target" ]; then
       if [ -L "$f" ]; then
         [ "$(readlink -- "$f")" = "$(readlink -- "$target" 2>/dev/null)" ] && continue
@@ -686,10 +782,30 @@ ob_restore_payload() {
       mkdir -p -- "$(dirname -- "$target")"
       cp -a -- "$f" "$target"
     fi
-  done < <(find "$tmp" \( -type f -o -type l \) -print0)
-
-  rm -rf -- "$tmp"
+  done < <(find "$tree" \( -type f -o -type l \) -print0)
   echo "  Payload restored to \$HOME (existing differing files backed up alongside themselves)."
+}
+
+# Names from the (untrusted) manifest reach pacman/yay/systemctl only if
+# they look like what they claim to be.
+ob_restore_pkg_name_valid() { [[ "$1" =~ ^[a-z0-9@._+][a-z0-9@._+-]*$ ]]; }
+ob_restore_unit_name_valid() {
+  [[ "$1" =~ ^[A-Za-z0-9:_.@\\][A-Za-z0-9:_.@\\-]*\.(service|timer|socket|path|target|mount|slice)$ ]]
+}
+
+# Missing packages, validated: prints "native <name>" / "aur <name>" /
+# "invalid <name>" lines.
+ob_restore_missing_packages() {  # <manifest json>
+  local have n kind
+  have="$(pacman -Qq 2>/dev/null | sort -u)"
+  for kind in native aur; do
+    local key=pacman_explicit; [ "$kind" = aur ] && key=aur_foreign
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      if ! ob_restore_pkg_name_valid "$n"; then printf 'invalid %s\n' "$n"; continue; fi
+      printf '%s\n' "$have" | grep -qxF -- "$n" || printf '%s %s\n' "$kind" "$n"
+    done < <(printf '%s' "$1" | jq -r --arg k "$key" '.packages[$k][]? | strings' 2>/dev/null | sort -u)
+  done
 }
 
 ob_restore_systemd() {
@@ -705,11 +821,15 @@ ob_restore_systemd() {
     name="$(echo "$u" | jq -r .name)"
     enabled="$(echo "$u" | jq -r .enabled)"
     active="$(echo "$u" | jq -r .active)"
+    if ! ob_restore_unit_name_valid "$name"; then
+      ob_restore_note "Ignored a unit name from the snapshot that is not a valid unit name: $(printf '%q' "$name")"
+      continue
+    fi
     if [ "$enabled" = "enabled" ]; then
-      ob_restore_run_step "enable $name" systemctl --user enable "$name"
+      ob_restore_run_step "enable $name" systemctl --user enable -- "$name"
     fi
     if [ "$active" = "active" ]; then
-      ob_restore_run_step "start $name" systemctl --user start "$name"
+      ob_restore_run_step "start $name" systemctl --user start -- "$name"
     fi
   done <<< "$units"
 }
@@ -722,6 +842,7 @@ ob_restore_verify() {
     case "$hash" in
       symlink:*) continue ;;
     esac
+    [ "$rel" = "$OB_RESTORE_HELD_BACK" ] && continue  # written as .restored
     path="$HOME/$rel"
     if [ ! -f "$path" ]; then
       ob_warn "Missing after restore: $path"

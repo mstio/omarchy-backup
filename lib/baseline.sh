@@ -77,6 +77,13 @@ ob_status() {
     actual_sha="$(sha256sum -- "$bdir/payload.tar.zst" | awk '{print $1}')"
     [ "$stored_sha" = "$actual_sha" ] || red_reasons+=("baseline payload checksum mismatch (corrupt archive)")
   fi
+  # Last integrity check of the destination (cached; status never goes online).
+  if [ -f "$OB_INTEGRITY_STATUS_FILE" ] && [ "${OB_STATUS_IGNORE_INTEGRITY:-false}" != true ]; then
+    local integ
+    while IFS= read -r integ; do
+      [ -n "$integ" ] && red_reasons+=("backup destination modified: $integ")
+    done < <(jq -r '.problems[]?' "$OB_INTEGRITY_STATUS_FILE" 2>/dev/null)
+  fi
 
   if [ "${#red_reasons[@]}" -gt 0 ]; then
     echo "Status: RED"
@@ -159,6 +166,7 @@ ob_status() {
 
   if [ "$any_drift" = false ]; then
     echo "Status: GREEN (matches baseline '$baseline_name')"
+    ob_status_repo_block
     return 0
   fi
 
@@ -183,10 +191,22 @@ ob_status() {
     [ -n "$removed_pkgs" ] && echo "$removed_pkgs" | sed 's/^/  package: /'
     [ -n "$removed_plugins" ] && echo "$removed_plugins" | sed 's/^/  plugin: /'
   fi
+  ob_status_repo_block
   # YELLOW is a valid state, not an error. Without this return the function
   # inherited the status of the last `[ -n ... ] &&` (1 when no plugins were
   # removed), and the bar widget showed ERROR.
   return 0
+}
+
+# Per declared repo: how much history the next snapshot carries. Skipped for
+# the widget's color probe (runs often; costs a few git calls per repo).
+ob_status_repo_block() {
+  [ "${OB_STATUS_QUIET:-false}" = true ] && return 0
+  local block; block="$(ob_repo_modes_report)"
+  [ -n "$block" ] || return 0
+  echo
+  echo "Git history in snapshots:"
+  printf '%s\n' "$block"
 }
 
 ob_status_color_only() {
@@ -194,7 +214,7 @@ ob_status_color_only() {
   # Piping ob_status directly into `head` closed stdout early and produced
   # misleading "echo: write error: Broken pipe" messages on YELLOW status.
   local status_output first_line color
-  status_output="$(ob_status)" || return 1
+  status_output="$(OB_STATUS_QUIET=true ob_status)" || return 1
   first_line="${status_output%%$'\n'*}"
   color="${first_line#Status: }"
   printf '%s\n' "${color%% *}"

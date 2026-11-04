@@ -39,6 +39,8 @@ source "$OB_LIB_DIR_BOOT/snapshot.sh"
 source "$OB_LIB_DIR_BOOT/baseline.sh"
 # shellcheck source=lib/remote.sh
 source "$OB_LIB_DIR_BOOT/remote.sh"
+# shellcheck source=lib/integrity.sh
+source "$OB_LIB_DIR_BOOT/integrity.sh"
 # shellcheck source=lib/restore.sh
 source "$OB_LIB_DIR_BOOT/restore.sh"
 # shellcheck source=lib/doctor.sh
@@ -62,7 +64,10 @@ Usage:
   omarchy-backup remote-list
   omarchy-backup pull <name>
   omarchy-backup restore <name> [--dry-run] [--from-remote] [--repos-from-snapshot]
-  omarchy-backup import <snapshot-folder>
+                         [--signer-github USER | --allowed-signers FILE]
+                         [--accept-unverified] [--yes]
+  omarchy-backup import <snapshot-folder> [--signer-github USER | --allowed-signers FILE] [--accept-unverified]
+  omarchy-backup integrity check|record <name>|forget <name>|reset [--yes]
   omarchy-backup doctor [--auto]
   omarchy-backup timers install|status|uninstall
   omarchy-backup config list|get <KEY>|set <KEY> <VALUE>
@@ -115,7 +120,13 @@ ob_cmd_snapshot() {
       ob_info "Omarchy version changed ($last_seen -> $current); running doctor before snapshotting."
       ob_doctor_run true || true
     fi
-    status_color="$(ob_status_color_only)"
+    # Is the destination still what this machine put there? A mismatch
+    # alerts (critical) and turns status red for the widget, but never
+    # stops the local backup itself.
+    if ob_remote_configured && ob_remote_ensure_available --check >/dev/null 2>&1; then
+      ob_integrity_check --notify >/dev/null || true
+    fi
+    status_color="$(OB_STATUS_IGNORE_INTEGRITY=true ob_status_color_only)"
     case "$status_color" in
       RED|UNKNOWN)
         ob_err "Status is $status_color; refusing to create or upload an automatic snapshot. Establish or repair the known-good baseline first."
@@ -181,6 +192,26 @@ ob_cmd_snapshot() {
   fi
 }
 
+# Trust decisions are per invocation (flags), never inherited from the
+# environment.
+OB_DRY_RUN=false
+OB_REPOS_FROM_SNAPSHOT=false
+OB_ACCEPT_UNVERIFIED=false
+OB_RESTORE_YES=false
+OB_SIG_GITHUB=""
+OB_SIG_ALLOWED_FILE=""
+ob_parse_trust_flags() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --accept-unverified) OB_ACCEPT_UNVERIFIED=true ;;
+      --signer-github) shift; OB_SIG_GITHUB="${1:-}"; [ -n "$OB_SIG_GITHUB" ] || ob_die "--signer-github needs a GitHub user name." ;;
+      --allowed-signers) shift; OB_SIG_ALLOWED_FILE="${1:-}"; [ -n "$OB_SIG_ALLOWED_FILE" ] || ob_die "--allowed-signers needs a file." ;;
+      *) ob_die "Unknown option: $1" ;;
+    esac
+    shift
+  done
+}
+
 main() {
   [ $# -eq 0 ] && { ob_usage; exit 1; }
   local cmd="$1"; shift || true
@@ -200,26 +231,34 @@ main() {
       ob_ensure_dirs; ob_load_config; ob_remote_push "$1" ;;
     remote-list) ob_ensure_dirs; ob_load_config; ob_remote_list ;;
     pull)
-      [ $# -ge 1 ] || ob_die "Usage: omarchy-backup pull <name>"
-      ob_ensure_dirs; ob_load_config; ob_remote_pull "$1" ;;
+      [ $# -ge 1 ] || ob_die "Usage: omarchy-backup pull <name> [--signer-github USER | --allowed-signers FILE] [--accept-unverified]"
+      local pname="$1"; shift
+      ob_parse_trust_flags "$@"
+      ob_ensure_dirs; ob_load_config; ob_remote_pull "$pname" ;;
     restore)
-      [ $# -ge 1 ] || ob_die "Usage: omarchy-backup restore <name> [--dry-run] [--from-remote] [--repos-from-snapshot]"
+      [ $# -ge 1 ] || ob_die "Usage: omarchy-backup restore <name> [--dry-run] [--from-remote] [--repos-from-snapshot] [--signer-github USER | --allowed-signers FILE] [--accept-unverified] [--yes]"
       local name="$1"; shift
       OB_DRY_RUN=false
+      local -a rest=()
       while [ $# -gt 0 ]; do
         case "$1" in
           --dry-run) OB_DRY_RUN=true ;;
           --from-remote) : ;; # ob_restore_run already falls back to remote automatically
           --repos-from-snapshot) export OB_REPOS_FROM_SNAPSHOT=true ;;
-          *) ob_die "Unknown option: $1" ;;
+          --yes) OB_RESTORE_YES=true ;;
+          *) rest+=("$1") ;;
         esac
         shift
       done
+      ob_parse_trust_flags "${rest[@]}"
       export OB_DRY_RUN
       ob_restore_run "$name" ;;
     import)
-      [ $# -ge 1 ] || ob_die "Usage: omarchy-backup import <snapshot-folder>"
-      ob_snapshot_import "$1" ;;
+      [ $# -ge 1 ] || ob_die "Usage: omarchy-backup import <snapshot-folder> [--signer-github USER | --allowed-signers FILE] [--accept-unverified]"
+      local src="$1"; shift
+      ob_parse_trust_flags "$@"
+      ob_snapshot_import "$src" ;;
+    integrity) ob_integrity_cmd "$@" ;;
     doctor)
       local auto=false
       [ "${1:-}" = "--auto" ] && auto=true

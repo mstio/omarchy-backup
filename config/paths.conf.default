@@ -96,7 +96,9 @@ exclude *.log
 exclude node_modules
 # .git is excluded from `include` lines; declare your own git checkouts
 # with `repo <path>` or `repo <folder>/*` instead -- snapshots then carry
-# their full history as a git bundle (see README, "Your own git checkouts").
+# what only this machine has of their history (all of it without a remote,
+# otherwise unpushed commits); `repo <path> full` keeps the full history
+# even with a remote (see README, "Your own git checkouts").
 exclude .git
 exclude *~
 exclude .DS_Store

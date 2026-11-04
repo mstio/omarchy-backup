@@ -13,6 +13,7 @@ export PATH="$ROOT_DIR/bin:$PATH"
 WORK="$(mktemp -d /tmp/omarchy-backup-tests.XXXXXX)"
 export RCLONE_CONFIG="$WORK/rclone.conf"
 export OMARCHY_BACKUP_PUSH_RETRY_DELAY=0
+export OMARCHY_BACKUP_TEST_MODE=true
 REMOTE_STORAGE="$WORK/remote-storage"
 mkdir -p "$REMOTE_STORAGE"
 cat > "$RCLONE_CONFIG" <<EOF
@@ -38,14 +39,14 @@ assert_eq() {
 
 assert_contains() {
   local desc="$1" haystack="$2" needle="$3"
-  if echo "$haystack" | grep -qF "$needle"; then ok "$desc"; else
+  if echo "$haystack" | grep -qF -- "$needle"; then ok "$desc"; else
     fail "$desc (did not find '$needle')"
   fi
 }
 
 assert_not_contains() {
   local desc="$1" haystack="$2" needle="$3"
-  if ! echo "$haystack" | grep -qF "$needle"; then ok "$desc"; else
+  if ! echo "$haystack" | grep -qF -- "$needle"; then ok "$desc"; else
     fail "$desc (unexpectedly found '$needle')"
   fi
 }
@@ -142,7 +143,7 @@ HOME="$HOME" configure_remote "$HOME"
 push_out="$(omarchy-backup push base 2>&1)"
 assert_contains "push uploaded" "$push_out" "Upload complete"
 assert_contains "push verified remote copy" "$push_out" "Upload copied; verifying"
-restore_out="$(HOME="$FRESH" omarchy-backup restore base 2>&1)"
+restore_out="$(HOME="$FRESH" omarchy-backup restore base --accept-unverified --yes 2>&1)"
 assert_contains "restore pulled from remote" "$restore_out" "not found locally; trying remote"
 assert_contains "restore integrity ok" "$restore_out" "Payload integrity OK"
 assert_contains "restore verified checksums across different \$HOME" "$restore_out" "All restored files verified against the snapshot's checksums."
@@ -156,7 +157,7 @@ HOME="$FRESH2" omarchy-backup init >/dev/null 2>&1
 HOME="$FRESH2" configure_remote "$FRESH2"
 mkdir -p "$FRESH2/.local/bin"
 echo "PRE-EXISTING, DO NOT LOSE" > "$FRESH2/.local/bin/mytool"
-HOME="$FRESH2" omarchy-backup restore base >/dev/null 2>&1
+HOME="$FRESH2" omarchy-backup restore base --accept-unverified --yes >/dev/null 2>&1
 bak_count="$(find "$FRESH2/.local/bin" -maxdepth 1 -name 'mytool.bak.*' | wc -l)"
 if [ "$bak_count" -ge 1 ]; then ok "pre-existing differing file was backed up, not lost"; else
   fail "pre-existing differing file was NOT backed up"
@@ -344,6 +345,10 @@ jq -n '{schema_version:1,snapshots:[
 ]}' > "$REMOTE_HOST_DIR/index.json"
 malicious_out="$(omarchy-backup push safe-next 2>&1)"; malicious_rc=$?
 assert_eq "push fails closed on a path-like remote index name" "1" "$malicious_rc"
+assert_contains "a rewritten remote index is caught by the integrity ledger first" "$malicious_out" "changed: index.json"
+omarchy-backup integrity reset --yes >/dev/null 2>&1
+malicious_out="$(omarchy-backup push safe-next 2>&1)"; malicious_rc=$?
+assert_eq "without the ledger the index check still fails closed" "1" "$malicious_rc"
 assert_contains "unsafe remote index is explained" "$malicious_out" "invalid or unsafe schema"
 assert_file "remote index cannot make retention purge outside its prefix" \
   "$REMOTE_STORAGE/remote-input-guards/outside/sentinel"
@@ -430,7 +435,7 @@ restore_into() {
   mkdir -p "$snap"
   cp "$SNAP_SRC/payload.tar.zst" "$SNAP_SRC/checksums.sha256" "$snap/"
   jq "$2" "$SNAP_SRC/manifest.json" > "$snap/manifest.json"
-  HOME="$h" PATH="$STUB_BIN:$PATH" omarchy-backup restore pinned 2>&1
+  HOME="$h" PATH="$STUB_BIN:$PATH" omarchy-backup restore pinned --accept-unverified --yes 2>&1
 }
 
 RESTORE_HOME="$WORK/plugin_fresh_ok"
@@ -692,7 +697,7 @@ repo_restore_into() {
   mkdir -p "$h/.local/share/omarchy-backup/snapshots/withrepo"
   cp "$RSNAP"/* "$h/.local/share/omarchy-backup/snapshots/withrepo/"
   shift
-  HOME="$h" omarchy-backup restore withrepo "$@" 2>&1
+  HOME="$h" omarchy-backup restore withrepo --accept-unverified --yes "$@" 2>&1
 }
 DRYR="$WORK/repo_dry"
 dry_out="$(repo_restore_into repo_dry --dry-run)"
@@ -716,14 +721,14 @@ assert_contains "restore says the remote is newer" "$n_out" "remote is newer tha
 BLOCK="$(new_home repo_blocked)"; mkdir -p "$BLOCK/Projects/tool"; echo keep > "$BLOCK/Projects/tool/file"
 HOME="$BLOCK" omarchy-backup init >/dev/null 2>&1
 mkdir -p "$BLOCK/.local/share/omarchy-backup/snapshots/withrepo"; cp "$RSNAP"/* "$BLOCK/.local/share/omarchy-backup/snapshots/withrepo/"
-b_out="$(HOME="$BLOCK" omarchy-backup restore withrepo 2>&1)"
+b_out="$(HOME="$BLOCK" omarchy-backup restore withrepo --accept-unverified --yes 2>&1)"
 assert_eq "existing non-git directory is left untouched" "keep" "$(cat "$BLOCK/Projects/tool/file")"
 assert_contains "the skipped repo is listed as a manual step" "$b_out" "is not a git checkout; not touched"
 # Hostile manifest path is refused.
 EVIL="$(new_home repo_evil)"; HOME="$EVIL" omarchy-backup init >/dev/null 2>&1
 mkdir -p "$EVIL/.local/share/omarchy-backup/snapshots/withrepo"; cp "$RSNAP"/* "$EVIL/.local/share/omarchy-backup/snapshots/withrepo/"
 jq '.repos[0].path="../escape"' "$RSNAP/manifest.json" > "$EVIL/.local/share/omarchy-backup/snapshots/withrepo/manifest.json"
-e_out="$(HOME="$EVIL" omarchy-backup restore withrepo 2>&1)"
+e_out="$(HOME="$EVIL" omarchy-backup restore withrepo --accept-unverified --yes 2>&1)"
 assert_contains "a repo path escaping HOME is refused" "$e_out" "unsafe path"
 assert_not_file "nothing is cloned outside HOME" "$WORK/escape"
 
@@ -734,30 +739,35 @@ SRCS1="$(sha256sum < "$RSRC/.local/share/omarchy-backup/repo-sources/Projects__t
 HOME="$RSRC" omarchy-backup snapshot unchanged-src >/dev/null 2>&1
 assert_eq "an unchanged repo yields a byte-identical archive (no false drift)" "$SRCS1" \
   "$(sha256sum < "$RSRC/.local/share/omarchy-backup/repo-sources/Projects__tool.tar")"
+assert_eq "fully pushed repo: no history bundle (metadata only)" "" "$(jq -r '.repos[0].history_bundle' "$RSNAP/manifest.json")"
 OFFR="$WORK/repo_offline"
 o_out="$(repo_restore_into repo_offline --repos-from-snapshot)"
 assert_file "--repos-from-snapshot restores the tree" "$OFFR/Projects/tool/bin/tool"
-assert_contains "--repos-from-snapshot uses the history bundle" "$o_out" "restored from the snapshot's history bundle (--repos-from-snapshot)"
-assert_eq "the bundle restore keeps the history" "$(git -C "$RSRC/Projects/tool" rev-parse HEAD~1)" "$(git -C "$OFFR/Projects/tool" rev-parse HEAD)"
-assert_eq "the bundle restore is complete (connectivity)" "0" "$(git -C "$OFFR/Projects/tool" fsck --connectivity-only >/dev/null 2>&1; echo $?)"
-assert_eq "the bundle restore sets the recorded origin" "$REPO_BARE" "$(git -C "$OFFR/Projects/tool" remote get-url origin)"
-assert_contains "the bundle restore reapplies tracked uncommitted edits" "$(cat "$OFFR/Projects/tool/bin/tool")" "local tweak"
+assert_not_file "without a bundle the file-only copy has no .git" "$OFFR/Projects/tool/.git"
+assert_contains "the file-only copy includes tracked uncommitted edits" "$(cat "$OFFR/Projects/tool/bin/tool")" "local tweak"
 assert_not_file "untracked files are not in the embedded copy" "$OFFR/Projects/tool/notes.txt"
 assert_eq "restored link works from the embedded copy" "tool-v1" "$(HOME="$OFFR" "$OFFR/.local/bin/tool" 2>/dev/null | head -1 || true)"
-# Without a bundle (older snapshot): file-only copy.
-NOBUN="$(new_home repo_nobundle)"; HOME="$NOBUN" omarchy-backup init >/dev/null 2>&1
-mkdir -p "$NOBUN/.local/share/omarchy-backup/snapshots/withrepo"; cp "$RSNAP"/* "$NOBUN/.local/share/omarchy-backup/snapshots/withrepo/"
-jq 'del(.repos[0].history_bundle)' "$RSNAP/manifest.json" > "$NOBUN/.local/share/omarchy-backup/snapshots/withrepo/manifest.json"
-nb_out="$(HOME="$NOBUN" omarchy-backup restore withrepo --repos-from-snapshot 2>&1)"
-assert_not_file "without a bundle the file-only copy has no .git" "$NOBUN/Projects/tool/.git"
-assert_contains "the file-only copy includes tracked uncommitted edits" "$(cat "$NOBUN/Projects/tool/bin/tool")" "local tweak"
-assert_contains "restore explains how to reconnect git later" "$nb_out" "git remote add origin $REPO_BARE"
+assert_contains "restore explains how to reconnect git later" "$o_out" "git remote add origin $REPO_BARE"
 DEADR="$(new_home repo_deadremote)"; HOME="$DEADR" omarchy-backup init >/dev/null 2>&1
 mkdir -p "$DEADR/.local/share/omarchy-backup/snapshots/withrepo"; cp "$RSNAP"/* "$DEADR/.local/share/omarchy-backup/snapshots/withrepo/"
 jq --arg r "$WORK/does-not-exist.git" '.repos[0].remote=$r' "$RSNAP/manifest.json" > "$DEADR/.local/share/omarchy-backup/snapshots/withrepo/manifest.json"
-d_out="$(HOME="$DEADR" omarchy-backup restore withrepo 2>&1)"
+d_out="$(HOME="$DEADR" omarchy-backup restore withrepo --accept-unverified --yes 2>&1)"
 assert_file "unreachable remote falls back to the embedded copy" "$DEADR/Projects/tool/bin/tool"
-assert_contains "the fallback is reported" "$d_out" "restored from the snapshot's history bundle (cloning failed)"
+assert_contains "the fallback is reported" "$d_out" "restored from the snapshot's embedded copy (cloning failed)"
+# `repo <path> full`: the whole history even though a remote has it.
+echo "repo ~/Projects/tool full" > "$RSRC/.config/omarchy-backup/paths.d/repos.conf"
+HOME="$RSRC" omarchy-backup snapshot withfull --replace unchanged-src >/dev/null 2>&1
+FSNAP="$RSRC/.local/share/omarchy-backup/snapshots/withfull"
+assert_eq "\`full\` makes a full bundle despite the remote" "full" "$(jq -r '.repos[0].history_bundle_kind' "$FSNAP/manifest.json")"
+FULLR="$(new_home repo_fullr)"; HOME="$FULLR" omarchy-backup init >/dev/null 2>&1
+mkdir -p "$FULLR/.local/share/omarchy-backup/snapshots/withfull"; cp "$FSNAP"/* "$FULLR/.local/share/omarchy-backup/snapshots/withfull/"
+f_out="$(HOME="$FULLR" omarchy-backup restore withfull --accept-unverified --yes --repos-from-snapshot 2>&1)"
+assert_contains "--repos-from-snapshot uses the full bundle" "$f_out" "restored from the snapshot's history bundle (--repos-from-snapshot)"
+assert_eq "the full-bundle restore keeps the history" "$(git -C "$RSRC/Projects/tool" rev-parse HEAD)" "$(git -C "$FULLR/Projects/tool" rev-parse HEAD 2>/dev/null)"
+assert_eq "the full-bundle restore is complete (connectivity)" "0" "$(git -C "$FULLR/Projects/tool" fsck --connectivity-only >/dev/null 2>&1; echo $?)"
+assert_eq "the full-bundle restore sets the recorded origin" "$REPO_BARE" "$(git -C "$FULLR/Projects/tool" remote get-url origin 2>/dev/null)"
+assert_contains "the full-bundle restore reapplies tracked uncommitted edits" "$(cat "$FULLR/Projects/tool/bin/tool")" "local tweak"
+echo "repo ~/Projects/tool" > "$RSRC/.config/omarchy-backup/paths.d/repos.conf"
 
 echo "== repos without a remote: history bundle, globs, doctor =="
 LONE="$(new_home repo_lone_home)"; HOME="$LONE" omarchy-backup init >/dev/null 2>&1
@@ -794,7 +804,7 @@ LREST="$(new_home repo_lone_restore)"; HOME="$LREST" omarchy-backup init >/dev/n
 mkdir -p "$LREST/.local/share/omarchy-backup/snapshots/lone"; cp "$LSNAP"/* "$LREST/.local/share/omarchy-backup/snapshots/lone/"
 ldry="$(HOME="$LREST" omarchy-backup restore lone --dry-run 2>&1)"
 assert_contains "dry run announces the bundle restore" "$ldry" "rebuild ~/Work/plugin-a from the snapshot's history bundle"
-lr_out="$(HOME="$LREST" omarchy-backup restore lone 2>&1)"
+lr_out="$(HOME="$LREST" omarchy-backup restore lone --accept-unverified --yes 2>&1)"
 assert_eq "restore rebuilds the history of a repo without remote" "$(git -C "$LONE/Work/plugin-a" rev-parse HEAD)" "$(git -C "$LREST/Work/plugin-a" rev-parse HEAD 2>/dev/null)"
 assert_eq "restore brings back the tags" "v1.0" "$(git -C "$LREST/Work/plugin-a" tag 2>/dev/null)"
 assert_eq "restore brings back other branches" "$(git -C "$LONE/Work/plugin-a" rev-parse feature)" "$(git -C "$LREST/Work/plugin-a" rev-parse feature 2>/dev/null)"
@@ -814,25 +824,44 @@ echo two >> "$UPS/Projects/up/f"; $G -C "$UPS/Projects/up" commit -q -am two-unp
 $G -C "$UPS/Projects/up" tag local-tag
 $G -C "$UPS/Projects/up" branch side; $G -C "$UPS/Projects/up" checkout -q side
 echo s > "$UPS/Projects/up/s"; $G -C "$UPS/Projects/up" add -A; $G -C "$UPS/Projects/up" commit -q -m side; $G -C "$UPS/Projects/up" checkout -q main
+ONE="$(git -C "$UPS/Projects/up" rev-parse HEAD~1)"
+$G -C "$UPS/Projects/up" tag pushed-light "$ONE"
+$G -C "$UPS/Projects/up" tag -a -m note pushed-annotated "$ONE"
+$G -C "$UPS/Projects/up" branch at-pushed "$ONE"
 echo "repo ~/Projects/up" > "$UPS/.config/omarchy-backup/paths.d/r.conf"
 HOME="$UPS" omarchy-backup snapshot up >/dev/null 2>&1
+USNAP="$UPS/.local/share/omarchy-backup/snapshots/up"
+assert_eq "delta: manifest says so" "delta" "$(jq -r '.repos[0].history_bundle_kind' "$USNAP/manifest.json")"
+assert_eq "delta: counts only the unpushed commits" "2" "$(jq -r '.repos[0].missing_commits' "$USNAP/manifest.json")"
+EMPTYG="$WORK/empty-git"; git init -q "$EMPTYG"
+assert_contains "delta: the bundle builds on the remote's commits" \
+  "$(git -C "$EMPTYG" bundle verify "$UPS/.local/share/omarchy-backup/repo-sources/Projects__up.bundle" 2>&1)" "$ONE"
+assert_eq "delta: no pushed commit is inside the bundle" "0" \
+  "$(git -C "$UPS/Projects/up" bundle list-heads "$UPS/.local/share/omarchy-backup/repo-sources/Projects__up.bundle" | grep -c "^$ONE ")"
+HOME="$UPS" omarchy-backup baseline up >/dev/null 2>&1
+assert_contains "status shows what the snapshot carries" "$(HOME="$UPS" omarchy-backup status 2>&1)" "~/Projects/up: missing commits only (2)"
+assert_contains "doctor shows what the snapshot carries" "$(HOME="$UPS" omarchy-backup doctor 2>&1)" "~/Projects/up: missing commits only (2)"
 UPR="$(new_home repo_up_rest)"; HOME="$UPR" omarchy-backup init >/dev/null 2>&1
 mkdir -p "$UPR/.local/share/omarchy-backup/snapshots/up"; cp "$UPS/.local/share/omarchy-backup/snapshots/up"/* "$UPR/.local/share/omarchy-backup/snapshots/up/"
-up_out="$(HOME="$UPR" omarchy-backup restore up 2>&1)"
+up_out="$(HOME="$UPR" omarchy-backup restore up --accept-unverified --yes 2>&1)"
 assert_contains "the clone path is used when the remote works" "$up_out" "clone $UP_BARE -> ~/Projects/up"
 assert_eq "unpushed commits come back on the clone path" "$(git -C "$UPS/Projects/up" rev-parse main)" "$(git -C "$UPR/Projects/up" rev-parse HEAD 2>/dev/null)"
 assert_eq "the branch stays checked out (not detached)" "main" "$(git -C "$UPR/Projects/up" symbolic-ref --short HEAD 2>/dev/null)"
 assert_eq "an unpublished branch comes back on the clone path" "$(git -C "$UPS/Projects/up" rev-parse side)" "$(git -C "$UPR/Projects/up" rev-parse side 2>/dev/null)"
-assert_eq "a local-only tag comes back on the clone path" "local-tag" "$(git -C "$UPR/Projects/up" tag 2>/dev/null)"
+assert_contains "a local-only tag comes back on the clone path" "$(git -C "$UPR/Projects/up" tag 2>/dev/null)" "local-tag"
+assert_eq "a local-only lightweight tag on a pushed commit comes back" "$ONE" "$(git -C "$UPR/Projects/up" rev-parse -q --verify pushed-light 2>/dev/null)"
+assert_eq "a local-only annotated tag on a pushed commit comes back" "$ONE" "$(git -C "$UPR/Projects/up" rev-parse -q --verify 'pushed-annotated^{commit}' 2>/dev/null)"
+assert_eq "a local-only branch on a pushed commit comes back" "$ONE" "$(git -C "$UPR/Projects/up" rev-parse -q --verify refs/heads/at-pushed 2>/dev/null)"
 assert_eq "no helper refs are left behind" "" "$(git -C "$UPR/Projects/up" for-each-ref refs/ob-snapshot 2>/dev/null)"
 assert_eq "origin is the real remote" "$UP_BARE" "$(git -C "$UPR/Projects/up" remote get-url origin 2>/dev/null)"
 # Detached HEAD with a commit no ref reaches: the bundle must be refreshed.
 $G -C "$UPS/Projects/up" checkout -q --detach; echo d >> "$UPS/Projects/up/f"; $G -C "$UPS/Projects/up" commit -q -am detached
 DET="$(git -C "$UPS/Projects/up" rev-parse HEAD)"
+echo "repo ~/Projects/up full" > "$UPS/.config/omarchy-backup/paths.d/r.conf"
 HOME="$UPS" omarchy-backup snapshot up-det >/dev/null 2>&1
 DETR="$(new_home repo_det_rest)"; HOME="$DETR" omarchy-backup init >/dev/null 2>&1
 mkdir -p "$DETR/.local/share/omarchy-backup/snapshots/up-det"; cp "$UPS/.local/share/omarchy-backup/snapshots/up-det"/* "$DETR/.local/share/omarchy-backup/snapshots/up-det/"
-HOME="$DETR" omarchy-backup restore up-det --repos-from-snapshot >/dev/null 2>&1
+HOME="$DETR" omarchy-backup restore up-det --accept-unverified --yes --repos-from-snapshot >/dev/null 2>&1
 assert_eq "a detached-HEAD commit is in the refreshed bundle" "$DET" "$(git -C "$DETR/Projects/up" rev-parse HEAD 2>/dev/null)"
 assert_file "the detached restore has a working tree" "$DETR/Projects/up/f"
 # Detached exactly at a branch tip: the restore must still fill the working tree.
@@ -843,7 +872,7 @@ echo "repo ~/Projects/tip" > "$TIP/.config/omarchy-backup/paths.d/r.conf"
 HOME="$TIP" omarchy-backup snapshot tip >/dev/null 2>&1
 TIPR="$(new_home repo_tip_rest)"; HOME="$TIPR" omarchy-backup init >/dev/null 2>&1
 mkdir -p "$TIPR/.local/share/omarchy-backup/snapshots/tip"; cp "$TIP/.local/share/omarchy-backup/snapshots/tip"/* "$TIPR/.local/share/omarchy-backup/snapshots/tip/"
-HOME="$TIPR" omarchy-backup restore tip >/dev/null 2>&1
+HOME="$TIPR" omarchy-backup restore tip --accept-unverified --yes >/dev/null 2>&1
 assert_file "detached at a branch tip: working tree restored" "$TIPR/Projects/tip/t"
 assert_eq "detached at a branch tip: nothing shows as deleted" "" "$(git -C "$TIPR/Projects/tip" status --porcelain 2>/dev/null)"
 # History with an object git fsck rejects (bad timezone) is still imported.
@@ -856,7 +885,7 @@ echo "repo ~/Projects/old" > "$FS/.config/omarchy-backup/paths.d/r.conf"
 HOME="$FS" omarchy-backup snapshot old >/dev/null 2>&1
 FSR="$(new_home repo_fsck_rest)"; HOME="$FSR" omarchy-backup init >/dev/null 2>&1
 mkdir -p "$FSR/.local/share/omarchy-backup/snapshots/old"; cp "$FS/.local/share/omarchy-backup/snapshots/old"/* "$FSR/.local/share/omarchy-backup/snapshots/old/"
-fs_out="$(HOME="$FSR" omarchy-backup restore old 2>&1)"
+fs_out="$(HOME="$FSR" omarchy-backup restore old --accept-unverified --yes 2>&1)"
 assert_eq "history git fsck objects to is still restored" "$BADC" "$(git -C "$FSR/Projects/old" rev-parse HEAD 2>/dev/null)"
 assert_contains "the unchecked import is reported" "$fs_out" "imported without that check"
 # Recorded branch exists only in the bundle: checked out as a branch, not detached.
@@ -866,7 +895,7 @@ sed -i '/exclude \*.bundle/d' "$UPS/.config/omarchy-backup/paths.d/r.conf"
 HOME="$UPS" omarchy-backup snapshot up-ol >/dev/null 2>&1
 OLR="$(new_home repo_ol_rest)"; HOME="$OLR" omarchy-backup init >/dev/null 2>&1
 mkdir -p "$OLR/.local/share/omarchy-backup/snapshots/up-ol"; cp "$UPS/.local/share/omarchy-backup/snapshots/up-ol"/* "$OLR/.local/share/omarchy-backup/snapshots/up-ol/"
-ol_out="$(HOME="$OLR" omarchy-backup restore up-ol 2>&1)"
+ol_out="$(HOME="$OLR" omarchy-backup restore up-ol --accept-unverified --yes 2>&1)"
 assert_eq "a branch only the bundle has is checked out as that branch" "only-local" "$(git -C "$OLR/Projects/up" symbolic-ref --short HEAD 2>/dev/null)"
 assert_not_contains "no misleading 'branch not found' note" "$ol_out" "branch 'only-local' not found"
 # A corrupt bundle falls back to the file-only copy.
@@ -874,10 +903,10 @@ COR="$(new_home repo_corrupt)"; HOME="$COR" omarchy-backup init >/dev/null 2>&1
 mkdir -p "$COR/.local/share/omarchy-backup/snapshots/up"; cp "$UPS/.local/share/omarchy-backup/snapshots/up"/* "$COR/.local/share/omarchy-backup/snapshots/up/"
 mkdir -p "$COR/.local/share/omarchy-backup/repo-sources"
 # The manifest points at a junk file the payload does not overwrite.
-jq '.repos[0].history_bundle=".local/share/omarchy-backup/repo-sources/junk.bundle"' \
+jq '.repos[0].history_bundle=".local/share/omarchy-backup/repo-sources/junk.bundle" | .repos[0].history_bundle_kind="full"' \
   "$UPS/.local/share/omarchy-backup/snapshots/up/manifest.json" > "$COR/.local/share/omarchy-backup/snapshots/up/manifest.json"
 echo "not a bundle" > "$COR/.local/share/omarchy-backup/repo-sources/junk.bundle"
-c_out="$(HOME="$COR" omarchy-backup restore up --repos-from-snapshot 2>&1)"
+c_out="$(HOME="$COR" omarchy-backup restore up --accept-unverified --yes --repos-from-snapshot 2>&1)"
 assert_contains "a corrupt bundle is reported" "$c_out" "history bundle could not be read"
 assert_file "a corrupt bundle falls back to the file-only copy" "$COR/Projects/up/f"
 # `exclude *.bundle` keeps history out, and the manifest says so.
@@ -885,33 +914,79 @@ echo "exclude *.bundle" >> "$UPS/.config/omarchy-backup/paths.d/r.conf"
 HOME="$UPS" omarchy-backup snapshot up-nob >/dev/null 2>&1
 assert_eq "an excluded bundle is not advertised in the manifest" "" "$(jq -r '.repos[0].history_bundle' "$UPS/.local/share/omarchy-backup/snapshots/up-nob/manifest.json")"
 assert_eq "an excluded bundle is not in the payload" "0" "$(zstd -q -d -c "$UPS/.local/share/omarchy-backup/snapshots/up-nob/payload.tar.zst" | tar -t | grep -c '\.bundle$')"
+# Delta lifecycle: written while something is unpushed, byte-identical when
+# unchanged, gone once everything is pushed; useless without the remote.
+ST_BARE="$WORK/st-upstream.git"; git init -q --bare -b main "$ST_BARE"
+STH="$(new_home repo_st_src)"; HOME="$STH" omarchy-backup init >/dev/null 2>&1
+git clone -q "$ST_BARE" "$STH/Projects/st" 2>/dev/null
+echo a > "$STH/Projects/st/a"; $G -C "$STH/Projects/st" add -A; $G -C "$STH/Projects/st" commit -q -m a; git -C "$STH/Projects/st" push -q origin main 2>/dev/null
+echo b >> "$STH/Projects/st/a"; $G -C "$STH/Projects/st" commit -q -am b
+echo "repo ~/Projects/st" > "$STH/.config/omarchy-backup/paths.d/r.conf"
+STB="$STH/.local/share/omarchy-backup/repo-sources/Projects__st.bundle"
+HOME="$STH" omarchy-backup snapshot st1 >/dev/null 2>&1
+assert_file "delta bundle exists while a commit is unpushed" "$STB"
+STB1="$(sha256sum < "$STB")"
+HOME="$STH" omarchy-backup snapshot st1b >/dev/null 2>&1
+assert_eq "an unchanged delta bundle stays byte-identical" "$STB1" "$(sha256sum < "$STB")"
+STDEAD="$(new_home repo_st_dead)"; HOME="$STDEAD" omarchy-backup init >/dev/null 2>&1
+mkdir -p "$STDEAD/.local/share/omarchy-backup/snapshots/st1"; cp "$STH/.local/share/omarchy-backup/snapshots/st1"/* "$STDEAD/.local/share/omarchy-backup/snapshots/st1/"
+jq --arg r "$WORK/gone.git" '.repos[0].remote=$r' "$STH/.local/share/omarchy-backup/snapshots/st1/manifest.json" > "$STDEAD/.local/share/omarchy-backup/snapshots/st1/manifest.json"
+std_out="$(HOME="$STDEAD" omarchy-backup restore st1 --accept-unverified --yes 2>&1)"
+assert_contains "delta without the remote: says why only files come back" "$std_out" "only holds the commits its remote lacked"
+assert_contains "delta without the remote: points at \`full\`" "$std_out" "repo ~/Projects/st full"
+assert_file "delta without the remote: the files come back" "$STDEAD/Projects/st/a"
+assert_not_file "delta without the remote: no half-built repo" "$STDEAD/Projects/st/.git"
+git -C "$STH/Projects/st" push -q origin main 2>/dev/null
+HOME="$STH" omarchy-backup snapshot st2 >/dev/null 2>&1
+assert_not_file "everything pushed: the stale delta bundle is removed" "$STB"
+assert_eq "everything pushed: manifest has no bundle" "" "$(jq -r '.repos[0].history_bundle_kind' "$STH/.local/share/omarchy-backup/snapshots/st2/manifest.json")"
+assert_contains "everything pushed: doctor says metadata only" "$(HOME="$STH" omarchy-backup doctor 2>&1)" "~/Projects/st: metadata only"
 # Globs with spaces; nested repos are not covered by the outer declaration.
 SP="$(new_home repo_spaces)"; HOME="$SP" omarchy-backup init >/dev/null 2>&1
 mkdir -p "$SP/My Work/app/vendor/lib"
 git init -q -b main "$SP/My Work/app"; echo a > "$SP/My Work/app/a"; $G -C "$SP/My Work/app" add a; $G -C "$SP/My Work/app" commit -q -m a
 git init -q -b main "$SP/My Work/app/vendor/lib"; echo l > "$SP/My Work/app/vendor/lib/l"; $G -C "$SP/My Work/app/vendor/lib" add -A; $G -C "$SP/My Work/app/vendor/lib" commit -q -m l
+SP_BARE="$WORK/sp-upstream.git"; git init -q --bare -b main "$SP_BARE"
+git -C "$SP/My Work/app" remote add origin "$SP_BARE"; git -C "$SP/My Work/app" push -q origin main 2>/dev/null
 printf 'repo ~/My Work/*\n' > "$SP/.config/omarchy-backup/paths.d/r.conf"
+assert_contains "glob without \`full\`, pushed repo: metadata only" "$(HOME="$SP" omarchy-backup doctor 2>&1)" "~/My Work/app: metadata only"
+printf 'repo ~/My Work/* full\n' > "$SP/.config/omarchy-backup/paths.d/r.conf"
 printf 'OB_CFG_REPO_SCAN_ROOTS="~/Projects"\n' >> "$SP/.config/omarchy-backup/config.conf"
 echo "include ~/My Work" >> "$SP/.config/omarchy-backup/paths.d/r.conf"
 sp_doc="$(HOME="$SP" omarchy-backup doctor 2>&1)"
 assert_contains "a glob with spaces declares the repo" "$sp_doc" "$(printf '%-28s %s' 'Own git checkouts' 'OK')"
+assert_contains "\`full\` works with a glob and spaces" "$sp_doc" "~/My Work/app: full history (repo ... full)"
+HOME="$SP" omarchy-backup snapshot spfull >/dev/null 2>&1
+assert_eq "\`full\` via glob: full bundle in the manifest" "full" "$(jq -r '.repos[] | select(.path=="My Work/app") | .history_bundle_kind' "$SP/.local/share/omarchy-backup/snapshots/spfull/manifest.json")"
 assert_not_contains "the glob-declared repo is not flagged" "$sp_doc" "~/My Work/app (no remote"
 assert_contains "a nested repo is flagged although its parent is declared" "$sp_doc" "~/My Work/app/vendor/lib (no remote; files backed up, history not)"
+
+echo "== a repo with a huge uncommitted diff (argument size limit) =="
+BIGH="$(new_home repo_bigdiff)"; HOME="$BIGH" omarchy-backup init >/dev/null 2>&1
+git init -q -b main "$BIGH/Projects/big"; seq 1 40000 > "$BIGH/Projects/big/data.txt"
+$G -C "$BIGH/Projects/big" add -A; $G -C "$BIGH/Projects/big" commit -q -m big
+seq 1 40000 | sed 's/$/ changed/' > "$BIGH/Projects/big/data.txt"
+echo "repo ~/Projects/big" > "$BIGH/.config/omarchy-backup/paths.d/r.conf"
+big_rc=0; HOME="$BIGH" omarchy-backup snapshot big >/dev/null 2>&1 || big_rc=$?
+assert_eq "a snapshot with a >200 KB diff succeeds" "0" "$big_rc"
+assert_eq "the whole diff is in the manifest" "true" \
+  "$(jq '.repos[0].diff | length > 200000' "$BIGH/.local/share/omarchy-backup/snapshots/big/manifest.json" 2>/dev/null)"
+assert_contains "status works with a huge diff" "$(HOME="$BIGH" omarchy-backup status 2>&1)" "Status:"
 
 echo "== import: a snapshot folder obtained without rclone =="
 DL="$WORK/downloaded/withrepo"; mkdir -p "$DL"; cp "$RSNAP"/* "$DL/"
 IMP="$(new_home repo_import)"; HOME="$IMP" omarchy-backup init >/dev/null 2>&1
-i_out="$(HOME="$IMP" omarchy-backup import "$DL" 2>&1)"
+i_out="$(HOME="$IMP" omarchy-backup import "$DL" --accept-unverified 2>&1)"
 assert_contains "import names the next step" "$i_out" "omarchy-backup restore withrepo --dry-run"
 assert_eq "imported snapshot is listed in state" "withrepo" "$(jq -r '.snapshots[0].name' "$IMP/.local/share/omarchy-backup/state.json")"
-HOME="$IMP" omarchy-backup restore withrepo --repos-from-snapshot >/dev/null 2>&1
+HOME="$IMP" omarchy-backup restore withrepo --accept-unverified --yes --repos-from-snapshot >/dev/null 2>&1
 assert_file "imported snapshot restores" "$IMP/Projects/tool/bin/tool"
-i2_rc=0; HOME="$IMP" omarchy-backup import "$DL" >/dev/null 2>&1 || i2_rc=$?
+i2_rc=0; HOME="$IMP" omarchy-backup import "$DL" --accept-unverified >/dev/null 2>&1 || i2_rc=$?
 assert_eq "importing the same snapshot twice is refused" "1" "$i2_rc"
 BAD="$WORK/downloaded/bad"; mkdir -p "$BAD"; cp "$RSNAP"/* "$BAD/"; jq '.name="badcopy"' "$RSNAP/manifest.json" > "$BAD/manifest.json"
 printf 'x' >> "$BAD/payload.tar.zst"
 IMP2="$(new_home repo_import_bad)"; HOME="$IMP2" omarchy-backup init >/dev/null 2>&1
-b2_out="$(HOME="$IMP2" omarchy-backup import "$BAD" 2>&1)"
+b2_out="$(HOME="$IMP2" omarchy-backup import "$BAD" --accept-unverified 2>&1)"
 assert_contains "a corrupt download is refused" "$b2_out" "checksum mismatch"
 assert_not_file "nothing is imported from a corrupt download" "$IMP2/.local/share/omarchy-backup/snapshots/badcopy"
 
@@ -968,6 +1043,308 @@ mkdir -p "$APPS_FRESH/.local/share/omarchy-backup/snapshots"
 cp -r "$APPS_HOME/.local/share/omarchy-backup/snapshots/apps" "$APPS_FRESH/.local/share/omarchy-backup/snapshots/apps"
 apps_out="$(HOME="$APPS_FRESH" PATH="$STUB_BIN:$PATH" omarchy-backup restore apps --dry-run 2>&1)"
 assert_contains "restore names mise install" "$apps_out" "mise install"
+
+echo "== never trust the destination: integrity ledger =="
+NOTIFY_BIN="$WORK/notify-bin"; mkdir -p "$NOTIFY_BIN"
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s/notify.log"\n' "$WORK" > "$NOTIFY_BIN/notify-send"; chmod +x "$NOTIFY_BIN/notify-send"
+HOME="$(new_home home_integrity)"; omarchy-backup init >/dev/null 2>&1
+configure_remote "$HOME" integrity
+seed_workspace "$HOME"
+omarchy-backup snapshot i-base --baseline >/dev/null 2>&1
+omarchy-backup push i-base >/dev/null 2>&1
+LEDGER="$HOME/.local/share/omarchy-backup/integrity-ledger.json"
+assert_eq "push records the backend's md5 of the payload" "$(md5sum < "$HOME/.local/share/omarchy-backup/snapshots/i-base/payload.tar.zst" | awk '{print $1}')" \
+  "$(jq -r '.snapshots["i-base"].files["payload.tar.zst"].md5' "$LEDGER")"
+assert_not_contains "the ledger is not part of any snapshot" "$(zstd -q -d -c "$HOME/.local/share/omarchy-backup/snapshots/i-base/payload.tar.zst" | tar -t)" "integrity-ledger"
+ic_rc=0; omarchy-backup integrity check >/dev/null 2>&1 || ic_rc=$?
+assert_eq "untouched destination passes the integrity check" "0" "$ic_rc"
+# Attacker: new payload AND a recomputed manifest checksum.
+IR="$REMOTE_STORAGE/integrity/$(hostname)/i-base"
+printf 'evil' >> "$IR/payload.tar.zst"
+jq --arg s "$(sha256sum < "$IR/payload.tar.zst" | awk '{print $1}')" '.payload.sha256=$s' "$IR/manifest.json" > "$WORK/m.json" && cp "$WORK/m.json" "$IR/manifest.json"
+mkdir -p "$REMOTE_STORAGE/integrity/$(hostname)/planted"; echo x > "$REMOTE_STORAGE/integrity/$(hostname)/planted/manifest.json"
+i_doc="$(omarchy-backup doctor 2>&1)"
+assert_contains "doctor fails on a tampered destination" "$i_doc" "$(printf '%-28s %s' 'Destination integrity' 'FAIL')"
+assert_contains "doctor names the replaced payload" "$i_doc" "changed: i-base/payload.tar.zst"
+assert_contains "doctor names the recomputed manifest" "$i_doc" "changed: i-base/manifest.json"
+assert_contains "doctor names a planted folder" "$i_doc" "added: planted/ (unknown folder)"
+assert_contains "status goes red after the check" "$(omarchy-backup status 2>&1 | head -n 1)" "Status: RED"
+assert_contains "status says why" "$(omarchy-backup status 2>&1)" "backup destination modified: changed: i-base/payload.tar.zst"
+rm -f "$WORK/notify.log"
+echo "drift = 1" >> "$HOME/.config/hypr/looknfeel.lua"
+PATH="$NOTIFY_BIN:$PATH" omarchy-backup snapshot i-auto --auto >/dev/null 2>&1
+assert_contains "the automatic run raises a critical alert" "$(cat "$WORK/notify.log" 2>/dev/null)" "-u critical"
+assert_contains "the alert says what happened" "$(cat "$WORK/notify.log" 2>/dev/null)" "backup destination was modified"
+PATH="$NOTIFY_BIN:$PATH" omarchy-backup snapshot i-auto2 --auto >/dev/null 2>&1
+assert_eq "an unchanged set of problems does not alert again" "1" "$(grep -c 'backup destination was modified' "$WORK/notify.log")"
+ib_out="$(omarchy-backup push i-auto 2>&1)"; ib_rc=$?
+assert_contains "no upload to a destination with unresolved problems" "$ib_out" "refusing to upload"
+assert_eq "the refused push fails" "1" "$ib_rc"
+assert_contains "the tampering is not adopted by later runs" "$(omarchy-backup doctor 2>&1)" "changed: i-base/payload.tar.zst"
+ipe_out="$(omarchy-backup pull i-base --accept-unverified 2>&1)"
+assert_contains "pull never replaces an existing local snapshot" "$ipe_out" "already exists"
+assert_file "the existing local snapshot is kept" "$HOME/.local/share/omarchy-backup/snapshots/i-base/payload.tar.zst"
+rm -rf "$HOME/.local/share/omarchy-backup/snapshots/i-base"
+ip_out="$(omarchy-backup pull i-base --accept-unverified 2>&1)"
+assert_contains "pull refuses content that differs from the upload" "$ip_out" "differs from what this machine uploaded"
+assert_not_file "nothing tampered is kept after pull" "$HOME/.local/share/omarchy-backup/snapshots/i-base/payload.tar.zst"
+assert_eq "no staging folder is left behind" "" "$(ls -A "$HOME/.local/share/omarchy-backup/snapshots" | grep '\.pull\.' || true)"
+# Resolving: delete what is not ours, forget the deleted snapshot.
+rm -rf "$REMOTE_STORAGE/integrity/$(hostname)/planted" "$IR"
+omarchy-backup integrity forget i-base >/dev/null 2>&1
+ir_rc=0; omarchy-backup integrity check >/dev/null 2>&1 || ir_rc=$?
+assert_eq "after cleanup and forget the destination is consistent again" "0" "$ir_rc"
+assert_contains "uploads work again after the cleanup" "$(omarchy-backup push i-auto 2>&1)" "Upload complete and verified"
+# Pre-planted folder with the name of the next upload: only our files count.
+HOME="$(new_home home_preplant)"; omarchy-backup init >/dev/null 2>&1
+configure_remote "$HOME" preplant
+seed_workspace "$HOME"
+omarchy-backup snapshot pp-1 >/dev/null 2>&1
+mkdir -p "$REMOTE_STORAGE/preplant/$(hostname)/pp-1"; echo evil > "$REMOTE_STORAGE/preplant/$(hostname)/pp-1/run-me.sh"
+omarchy-backup push pp-1 >/dev/null 2>&1
+assert_contains "a file planted before the upload stays a problem" "$(omarchy-backup integrity check 2>&1)" "added: pp-1/run-me.sh"
+echo evil > "$REMOTE_STORAGE/preplant/$(hostname)/notes.txt"
+assert_contains "a file planted next to index.json is a problem" "$(omarchy-backup integrity check 2>&1)" "added: notes.txt"
+# Mounted cloud folder: only size + date without downloading (weak).
+HOME="$(new_home home_integrity_weak)"; omarchy-backup init >/dev/null 2>&1
+WEAKD="$WORK/weak-dest"; mkdir -p "$WEAKD"
+omarchy-backup config set OB_CFG_REMOTE_PATH "$WEAKD" >/dev/null 2>&1
+seed_workspace "$HOME"
+omarchy-backup snapshot w-base >/dev/null 2>&1
+TZ=Europe/Berlin OMARCHY_BACKUP_TEST_WEAK_INTEGRITY=true omarchy-backup push w-base >/dev/null 2>&1
+wtz_rc=0; TZ=America/New_York OMARCHY_BACKUP_TEST_WEAK_INTEGRITY=true omarchy-backup integrity check >/dev/null 2>&1 || wtz_rc=$?
+assert_eq "a time zone change is no change (weak mode)" "0" "$wtz_rc"
+assert_not_contains "without test mode the weak hook is ignored" \
+  "$(OMARCHY_BACKUP_TEST_MODE=false OMARCHY_BACKUP_TEST_WEAK_INTEGRITY=true omarchy-backup doctor 2>&1)" "only by size and date"
+w_doc="$(OMARCHY_BACKUP_TEST_WEAK_INTEGRITY=true omarchy-backup doctor 2>&1)"
+assert_contains "doctor says when only a weak check is possible" "$w_doc" "only by size and date"
+assert_contains "doctor names the way to a strong check" "$w_doc" "OB_CFG_INTEGRITY_RCLONE_REMOTE"
+printf 'x' >> "$WEAKD/$(hostname)/w-base/payload.tar.zst"
+w_doc="$(OMARCHY_BACKUP_TEST_WEAK_INTEGRITY=true omarchy-backup doctor 2>&1)"
+assert_contains "the weak check still catches a changed size" "$w_doc" "changed: w-base/payload.tar.zst"
+# An upload from before the ledger existed (local slot already rotated away,
+# but listed in the remote index) is "unrecorded", not an unknown folder.
+WL="$HOME/.local/share/omarchy-backup/integrity-ledger.json"
+jq --argjson later "$(( $(date +%s) + 3600 ))" '.snapshots = {} | .base = null | .created_epoch = $later' "$WL" > "$WORK/wl.json" && cp "$WORK/wl.json" "$WL"
+jq '.snapshots = []' "$HOME/.local/share/omarchy-backup/state.json" > "$WORK/ws.json" && cp "$WORK/ws.json" "$HOME/.local/share/omarchy-backup/state.json"
+wu_out="$(OMARCHY_BACKUP_TEST_WEAK_INTEGRITY=true omarchy-backup integrity check 2>&1)"
+assert_contains "an indexed pre-ledger upload is offered for adoption" "$wu_out" "integrity record w-base"
+assert_not_contains "an indexed pre-ledger upload is not an unknown folder" "$wu_out" "unknown folder"
+
+echo "== never trust the destination: signatures =="
+GHAPI="$WORK/ghapi"; mkdir -p "$GHAPI/users/testsigner" "$GHAPI/users/other"
+export OMARCHY_BACKUP_GITHUB_API="file://$GHAPI"
+HOME="$(new_home home_sign)"; omarchy-backup init >/dev/null 2>&1
+seed_workspace "$HOME"
+SKEY="$HOME/.config/omarchy-backup/backup-ident"
+ssh-keygen -q -t ed25519 -N '' -C test -f "$SKEY"; chmod 600 "$SKEY"
+ssh-keygen -q -t ed25519 -N '' -C other -f "$WORK/other-key"
+jq -n --arg k "$(cat "$SKEY.pub")" '[{id:1, key:$k, title:"backup"}]' > "$GHAPI/users/testsigner/ssh_signing_keys"
+jq -n --arg k "$(cat "$WORK/other-key.pub")" '[{id:2, key:$k, title:"x"}]' > "$GHAPI/users/other/ssh_signing_keys"
+s_doc="$(omarchy-backup doctor 2>&1)"
+assert_contains "doctor warns when nothing is signed" "$s_doc" "no signing key configured"
+omarchy-backup snapshot unsigned1 >/dev/null 2>&1
+echo "include ~/.config/omarchy-backup" > "$HOME/.config/omarchy-backup/paths.d/self.conf"
+omarchy-backup config set OB_CFG_SIGNING_KEY "~/.config/omarchy-backup/backup-ident" >/dev/null 2>&1
+omarchy-backup config set OB_CFG_SIGNER_GITHUB testsigner >/dev/null 2>&1
+assert_contains "doctor accepts a key the trust anchor knows" "$(omarchy-backup doctor 2>&1)" "$(printf '%-28s %s' 'Snapshot signatures' 'OK')"
+omarchy-backup snapshot signed1 >/dev/null 2>&1
+SDIR="$HOME/.local/share/omarchy-backup/snapshots/signed1"
+assert_file "snapshot manifest is signed" "$SDIR/manifest.json.sig"
+assert_eq "the signing key never enters the payload (only its .pub)" "0" "$(zstd -q -d -c "$SDIR/payload.tar.zst" | tar -t | grep -c 'backup-ident$')"
+assert_not_contains "the signing key is not in the checksums" "$(cat "$SDIR/checksums.sha256")" "backup-ident "
+assert_contains "the rest of the tool's config is still backed up" "$(zstd -q -d -c "$SDIR/payload.tar.zst" | tar -t)" ".config/omarchy-backup/config.conf"
+omarchy-backup config set OB_CFG_SIGNER_GITHUB other >/dev/null 2>&1
+assert_contains "doctor warns when the anchor does not know the key" "$(omarchy-backup doctor 2>&1)" "not among the keys"
+omarchy-backup config set OB_CFG_SIGNER_GITHUB testsigner >/dev/null 2>&1
+# A fresh machine: trust comes from the command line, never the snapshot.
+sign_into() {  # <home> <snapshot> -> copies the snapshot into a fresh home
+  local h; h="$(new_home "$1")"; HOME="$h" omarchy-backup init >/dev/null 2>&1
+  mkdir -p "$h/.local/share/omarchy-backup/snapshots/$2"; cp "$HOME/.local/share/omarchy-backup/snapshots/$2"/* "$h/.local/share/omarchy-backup/snapshots/$2/"
+  echo "$h"
+}
+SV="$(sign_into sig_ok signed1)"
+sv_out="$(HOME="$SV" omarchy-backup restore signed1 --dry-run --signer-github testsigner 2>&1)"
+assert_contains "a genuine snapshot verifies and names the key" "$sv_out" "Signature OK: ED25519 key SHA256:"
+assert_contains "the trust anchor is named" "$sv_out" "GitHub signing keys of 'testsigner'"
+ST="$(sign_into sig_tampered signed1)"
+STD="$ST/.local/share/omarchy-backup/snapshots/signed1"
+printf 'evil' >> "$STD/payload.tar.zst"
+jq --arg s "$(sha256sum < "$STD/payload.tar.zst" | awk '{print $1}')" '.payload.sha256=$s' "$STD/manifest.json" > "$WORK/m2.json" && cp "$WORK/m2.json" "$STD/manifest.json"
+st_rc=0; st_out="$(HOME="$ST" omarchy-backup restore signed1 --signer-github testsigner --yes < /dev/null 2>&1)" || st_rc=$?
+assert_contains "a recomputed manifest fails the signature" "$st_out" "UNVERIFIED SNAPSHOT (invalid)"
+assert_contains "the restore stops without confirmation" "$st_out" "needs your confirmation"
+assert_eq "the stopped restore exits non-zero" "1" "$st_rc"
+assert_not_file "nothing was written" "$ST/.local/bin/mytool"
+SW="$(sign_into sig_wrong signed1)"
+assert_contains "an unknown signer is not trusted" "$(HOME="$SW" omarchy-backup restore signed1 --signer-github other --yes < /dev/null 2>&1)" "UNVERIFIED SNAPSHOT (invalid)"
+SU="$(sign_into sig_unsigned unsigned1)"
+su_out="$(HOME="$SU" omarchy-backup restore unsigned1 --signer-github testsigner --yes < /dev/null 2>&1)"
+assert_contains "an unsigned snapshot is reported" "$su_out" "UNVERIFIED SNAPSHOT (unsigned)"
+assert_not_file "an unsigned snapshot is not restored silently" "$SU/.local/bin/mytool"
+HOME="$SU" omarchy-backup restore unsigned1 --accept-unverified --yes < /dev/null >/dev/null 2>&1
+assert_file "--accept-unverified lets the user decide" "$SU/.local/bin/mytool"
+SA="$(sign_into sig_allowed signed1)"
+cp "$SKEY.pub" "$WORK/allowed.pub"
+assert_contains "a local allowed-signers file works as anchor" "$(HOME="$SA" omarchy-backup restore signed1 --dry-run --allowed-signers "$WORK/allowed.pub" 2>&1)" "Signature OK"
+SN="$(sign_into sig_noanchor signed1)"
+assert_contains "without any anchor nothing counts as verified" "$(HOME="$SN" omarchy-backup restore signed1 --dry-run 2>&1)" "UNVERIFIED SNAPSHOT (no-anchor)"
+SI="$WORK/sig-import-src"; mkdir -p "$SI"; cp "$STD"/* "$SI/"
+SIH="$(new_home sig_import)"; HOME="$SIH" omarchy-backup init >/dev/null 2>&1
+si_out="$(HOME="$SIH" omarchy-backup import "$SI" --signer-github testsigner < /dev/null 2>&1)"
+assert_contains "import checks the signature too" "$si_out" "UNVERIFIED SNAPSHOT (invalid)"
+assert_not_file "a refused import copies nothing" "$SIH/.local/share/omarchy-backup/snapshots/signed1"
+
+echo "== never trust the destination: restore review =="
+RV="$(sign_into review_new signed1)"
+rv_out="$(HOME="$RV" omarchy-backup restore signed1 --signer-github testsigner < /dev/null 2>&1)"; rv_rc=$?
+assert_contains "restore lists what would be written" "$rv_out" "NEW  ~/.local/bin/mytool"
+assert_contains "a new file is shown with its content" "$rv_out" "| echo hi"
+assert_contains "the review groups per folder" "$rv_out" "new    0 changed  ~/.local/bin"
+assert_contains "agent instructions count as security-relevant" "$rv_out" "~/.claude/projects/testproj/memory"
+assert_contains "without --yes a non-interactive restore stops" "$rv_out" "Stopped before writing anything"
+assert_eq "the stopped review exits non-zero" "1" "$rv_rc"
+assert_not_file "the review stops before any write" "$RV/.local/bin/mytool"
+RC="$(sign_into review_changed signed1)"
+mkdir -p "$RC/.local/bin"; printf '#!/bin/bash\necho mine\n' > "$RC/.local/bin/mytool"
+rc_out="$(HOME="$RC" omarchy-backup restore signed1 --dry-run --signer-github testsigner 2>&1)"
+assert_contains "a differing file is marked CHANGED" "$rc_out" "CHANGED  ~/.local/bin/mytool"
+assert_contains "the difference is shown" "$rc_out" "-echo mine"
+assert_eq "dry run leaves the file alone" "mine" "$(sed -n 2p "$RC/.local/bin/mytool" | awk '{print $2}')"
+rcy_out="$(HOME="$RC" omarchy-backup restore signed1 --signer-github testsigner --yes < /dev/null 2>&1)"
+assert_contains "--yes accepts the reviewed content" "$(cat "$RC/.local/bin/mytool")" "echo hi"
+assert_contains "the review shows the tool's own config in full" "$rcy_out" "+OB_CFG_SIGNER_GITHUB='testsigner'"
+assert_file "the snapshot's config.conf is written next to the active one" "$RC/.config/omarchy-backup/config.conf.restored"
+assert_not_contains "the active config.conf is not replaced" "$(cat "$RC/.config/omarchy-backup/config.conf")" "testsigner"
+assert_contains "the user is told how to adopt it" "$rcy_out" "mv ~/.config/omarchy-backup/config.conf.restored"
+# The environment carries no trust decisions.
+RE="$(sign_into review_env signed1)"
+OB_DRY_RUN=true OB_RESTORE_YES=true HOME="$RE" omarchy-backup restore signed1 --signer-github testsigner < /dev/null >/dev/null 2>&1
+assert_not_file "OB_RESTORE_YES from the environment is ignored" "$RE/.local/bin/mytool"
+OB_DRY_RUN=true HOME="$RE" omarchy-backup restore signed1 --signer-github testsigner --yes < /dev/null >/dev/null 2>&1
+assert_file "OB_DRY_RUN from the environment does not make a restore dry" "$RE/.local/bin/mytool"
+RX="$(sign_into review_api signed1)"
+assert_not_contains "without test mode the GitHub API override is ignored" \
+  "$(OMARCHY_BACKUP_TEST_MODE=false https_proxy=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 HOME="$RX" omarchy-backup restore signed1 --dry-run --signer-github testsigner 2>&1)" "Signature OK"
+# Hostile names in the manifest never reach pacman or systemctl.
+RH="$(sign_into review_hostile signed1)"
+RHM="$RH/.local/share/omarchy-backup/snapshots/signed1/manifest.json"
+jq '.packages.pacman_explicit += ["--overwrite=*", "a;b"] | .packages.aur_foreign += ["-Syu"]
+    | .systemd_user_units += [{name:"-x.service",enabled:"enabled",active:"active"},
+                              {name:"../../evil.service",enabled:"enabled",active:"inactive"},
+                              {name:"ok-unit.timer",enabled:"enabled",active:"inactive"}]' "$RHM" > "$WORK/rh.json" && cp "$WORK/rh.json" "$RHM"
+rh_out="$(HOME="$RH" PATH="$STUB_BIN:$PATH" omarchy-backup restore signed1 --dry-run 2>&1)"
+assert_contains "an option-like package name is ignored" "$rh_out" "IGNORED  invalid package name: --overwrite=*"
+assert_contains "a package name with shell characters is ignored" "$rh_out" "IGNORED  invalid package name: a;b"
+assert_contains "an option-like AUR name is ignored" "$rh_out" "IGNORED  invalid package name: -Syu"
+assert_contains "an option-like unit name is ignored" "$rh_out" "IGNORED  invalid unit name: -x.service"
+assert_contains "a path-like unit name is ignored" "$rh_out" "IGNORED  invalid unit name: ../../evil.service"
+assert_contains "valid units are listed in the review" "$rh_out" "unit     ok-unit.timer (enable)"
+assert_contains "valid units are enabled with --" "$rh_out" "systemctl --user enable -- ok-unit.timer"
+assert_not_contains "no hostile unit reaches systemctl" "$rh_out" "enable -- -x.service"
+assert_not_contains "no hostile package reaches pacman" "$rh_out" "-- --overwrite"
+# Tool copy and RECOVERY.md are signed, recorded, and verifiable by hand.
+sed -i 's/^OB_CFG_REMOTE_NAME=.*/OB_CFG_REMOTE_NAME=testlocal/' "$HOME/.config/omarchy-backup/config.conf"
+omarchy-backup config set OB_CFG_REMOTE_PATH "$REMOTE_STORAGE/signed-extras" >/dev/null 2>&1
+mkdir -p "$REMOTE_STORAGE/signed-extras"
+echo "# notes" > "$HOME/notes.md"; omarchy-backup config set OB_CFG_RECOVERY_NOTES "~/notes.md" >/dev/null 2>&1
+omarchy-backup push signed1 >/dev/null 2>&1
+SXB="$REMOTE_STORAGE/signed-extras/$(hostname)"
+assert_file "the tool copy is signed" "$SXB/omarchy-backup-tool.tar.gz.sig"
+assert_file "RECOVERY.md is signed" "$SXB/RECOVERY.md.sig"
+jq -r '.[].key' "$GHAPI/users/testsigner/ssh_signing_keys" | sed 's/^/backup-signer namespaces="omarchy-backup" /' > "$WORK/allowed-readme"
+assert_contains "the README recipe verifies the tool copy" \
+  "$(ssh-keygen -Y verify -f "$WORK/allowed-readme" -I backup-signer -n omarchy-backup -s "$SXB/omarchy-backup-tool.tar.gz.sig" < "$SXB/omarchy-backup-tool.tar.gz" 2>&1)" "Good"
+assert_contains "the README recipe verifies RECOVERY.md" \
+  "$(ssh-keygen -Y verify -f "$WORK/allowed-readme" -I backup-signer -n omarchy-backup -s "$SXB/RECOVERY.md.sig" < "$SXB/RECOVERY.md" 2>&1)" "Good"
+assert_eq "the ledger covers the signed tool copy" "true" \
+  "$(jq '.base.files | has("omarchy-backup-tool.tar.gz") and has("omarchy-backup-tool.tar.gz.sig") and has("RECOVERY.md.sig") and has("index.json")' "$HOME/.local/share/omarchy-backup/integrity-ledger.json")"
+unset OMARCHY_BACKUP_GITHUB_API
+
+echo "== never trust the destination: recording, adoption, pending uploads, staging =="
+HOME="$(new_home home_round2)"; omarchy-backup init >/dev/null 2>&1
+configure_remote "$HOME" round2
+seed_workspace "$HOME"
+R2="$REMOTE_STORAGE/round2/$(hostname)"
+omarchy-backup snapshot rc-1 >/dev/null 2>&1
+REC_BIN="$WORK/rec-bin"; mkdir -p "$REC_BIN"
+cat > "$REC_BIN/rclone" <<REC
+#!/bin/bash
+# Someone swaps the payload right after the verification.
+if [ "\$1" = check ]; then "$REAL_RCLONE" "\$@"; rc=\$?; printf x >> "$R2/rc-1/payload.tar.zst"; exit \$rc; fi
+exec "$REAL_RCLONE" "\$@"
+REC
+chmod +x "$REC_BIN/rclone"
+rec_rc=0; rec_out="$(PATH="$REC_BIN:$PATH" omarchy-backup push rc-1 2>&1)" || rec_rc=$?
+assert_eq "a destination that differs right after upload fails the push (retry)" "75" "$rec_rc"
+assert_contains "the failed record is explained" "$rec_out" "treating it as not uploaded"
+assert_eq "such an upload is not marked as pushed" "null" \
+  "$(jq -r '.snapshots[] | select(.name=="rc-1") | .remote_pushed // "null"' "$HOME/.local/share/omarchy-backup/state.json")"
+assert_eq "nothing unverified is recorded" "null" "$(jq -r '.snapshots["rc-1"] // "null"' "$HOME/.local/share/omarchy-backup/integrity-ledger.json" 2>/dev/null || echo null)"
+assert_contains "the retry overwrites and records the upload" "$(omarchy-backup push rc-1 2>&1)" "Upload complete and verified"
+# Listed as uploaded after the ledger existed, but never recorded: a problem.
+sleep 1
+omarchy-backup snapshot rc-2 >/dev/null 2>&1
+mkdir -p "$R2/rc-2"; cp "$HOME/.local/share/omarchy-backup/snapshots/rc-2"/* "$R2/rc-2/"
+jq '.snapshots |= map(if .name=="rc-2" then .remote_pushed=true else . end)' "$HOME/.local/share/omarchy-backup/state.json" > "$WORK/r2s.json" \
+  && cp "$WORK/r2s.json" "$HOME/.local/share/omarchy-backup/state.json"
+assert_contains "pushed after the ledger existed but unrecorded is a problem" "$(omarchy-backup integrity check 2>&1)" \
+  "added: rc-2/ (listed as uploaded after the ledger existed, but never recorded)"
+rm -rf "$R2/rc-2"
+jq '.snapshots |= map(if .name=="rc-2" then .remote_pushed=false else . end)' "$HOME/.local/share/omarchy-backup/state.json" > "$WORK/r2s.json" \
+  && cp "$WORK/r2s.json" "$HOME/.local/share/omarchy-backup/state.json"
+# Adoption: only the snapshot's own files, only if they match the local copy.
+L2="$HOME/.local/share/omarchy-backup/integrity-ledger.json"
+jq '.snapshots |= del(.["rc-1"]) | .created_epoch = 4102444800' "$L2" > "$WORK/l2.json" && cp "$WORK/l2.json" "$L2"
+echo evil > "$R2/rc-1/extra.sh"
+ad_out="$(omarchy-backup integrity record rc-1 2>&1)"
+assert_contains "adoption names what it leaves out" "$ad_out" "extra.sh"
+assert_contains "a planted extra file stays a problem after adoption" "$(omarchy-backup integrity check 2>&1)" "added: rc-1/extra.sh"
+rm -f "$R2/rc-1/extra.sh"
+jq '.snapshots |= del(.["rc-1"])' "$L2" > "$WORK/l2.json" && cp "$WORK/l2.json" "$L2"
+printf 'x' >> "$R2/rc-1/payload.tar.zst"
+ad2_rc=0; ad2_out="$(omarchy-backup integrity record rc-1 2>&1)" || ad2_rc=$?
+assert_contains "adoption refuses content that differs from the local copy" "$ad2_out" "differs from the local copy"
+assert_eq "the refused adoption fails" "1" "$ad2_rc"
+mv "$HOME/.local/share/omarchy-backup/snapshots/rc-1" "$WORK/rc-1-away"
+ad3_rc=0; ad3_out="$(omarchy-backup integrity record rc-1 < /dev/null 2>&1)" || ad3_rc=$?
+assert_contains "without a local copy adoption says what it would trust" "$ad3_out" "trusts whatever the destination holds"
+assert_eq "without a local copy adoption needs --yes" "1" "$ad3_rc"
+assert_contains "with --yes it is adopted" "$(omarchy-backup integrity record rc-1 --yes 2>&1)" "Recorded 'rc-1'"
+mv "$WORK/rc-1-away" "$HOME/.local/share/omarchy-backup/snapshots/rc-1"
+cp "$HOME/.local/share/omarchy-backup/snapshots/rc-1/payload.tar.zst" "$R2/rc-1/payload.tar.zst"
+omarchy-backup integrity forget rc-1 >/dev/null 2>&1; omarchy-backup integrity record rc-1 >/dev/null 2>&1
+# Pending uploads: only snapshots newer than the last successful upload.
+jq '.created_epoch = 1' "$L2" > "$WORK/l2.json" && cp "$WORK/l2.json" "$L2"
+omarchy-backup snapshot rc-old >/dev/null 2>&1
+sleep 1
+jq --argjson t "$(date +%s)" '.last_push_epoch = $t' "$HOME/.local/share/omarchy-backup/state.json" > "$WORK/r2s.json" \
+  && cp "$WORK/r2s.json" "$HOME/.local/share/omarchy-backup/state.json"
+sleep 1
+mkdir -p "$R2/rc-old"; echo x > "$R2/rc-old/payload.tar.zst"
+assert_contains "a folder named after an old local snapshot is a problem" "$(omarchy-backup integrity check 2>&1)" "added: rc-old/ (unknown folder)"
+rm -rf "$R2/rc-old"
+omarchy-backup snapshot rc-new --replace rc-old >/dev/null 2>&1
+mkdir -p "$R2/rc-new"; echo x > "$R2/rc-new/payload.tar.zst"
+assert_not_contains "a newer local snapshot's unfinished upload is not a problem" "$(omarchy-backup integrity check 2>&1)" "rc-new"
+rm -rf "$R2/rc-new"
+# Restore: an incomplete local folder is moved aside; old staging is swept.
+rm -f "$HOME/.local/share/omarchy-backup/snapshots/rc-1/manifest.json"
+printf '#!/bin/bash\necho changed\n' > "$HOME/.local/bin/mytool"
+mkdir -p "$HOME/.local/share/omarchy-backup/.restore-stage.old1" "$HOME/.local/share/omarchy-backup/.restore-stage.new1" \
+  "$HOME/.local/share/omarchy-backup/snapshots/.rc-9.pull.123"
+touch -d '2 days ago' "$HOME/.local/share/omarchy-backup/.restore-stage.old1" "$HOME/.local/share/omarchy-backup/snapshots/.rc-9.pull.123"
+st_out="$(omarchy-backup restore rc-1 --dry-run --accept-unverified 2>&1)"
+assert_contains "an incomplete local snapshot is moved aside" "$st_out" "moved aside to"
+assert_eq "it is kept under a stale name" "1" "$(ls -d "$HOME/.local/share/omarchy-backup/snapshots/rc-1.stale-"* 2>/dev/null | wc -l)"
+assert_file "the restore downloads it again" "$HOME/.local/share/omarchy-backup/snapshots/rc-1/manifest.json"
+assert_not_file "old staging leftovers are swept" "$HOME/.local/share/omarchy-backup/.restore-stage.old1"
+assert_not_file "old pull leftovers are swept" "$HOME/.local/share/omarchy-backup/snapshots/.rc-9.pull.123"
+assert_file "current staging folders are left alone" "$HOME/.local/share/omarchy-backup/.restore-stage.new1"
+assert_contains "the full review is written to a file" "$st_out" "Full review: $HOME/.local/share/omarchy-backup/restore-review-rc-1-"
+RVF="$(ls "$HOME/.local/share/omarchy-backup/restore-review-rc-1-"*.txt 2>/dev/null | head -n 1)"
+assert_eq "the review file is private" "600" "$(stat -c %a "$RVF" 2>/dev/null)"
+assert_contains "code is shown in full in the review file" "$(cat "$RVF")" "+echo hi"
 
 echo "== Summary: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]
