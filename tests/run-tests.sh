@@ -1346,5 +1346,49 @@ RVF="$(ls "$HOME/.local/share/omarchy-backup/restore-review-rc-1-"*.txt 2>/dev/n
 assert_eq "the review file is private" "600" "$(stat -c %a "$RVF" 2>/dev/null)"
 assert_contains "code is shown in full in the review file" "$(cat "$RVF")" "+echo hi"
 
+echo "== integrity: a mounted destination shows the upload only later =="
+# Upload through a mount (REMOTE_PATH), integrity listing straight from the
+# backend (here: a second folder that catches up 3 s after each write, like
+# rclone's VFS write-back). Recording waits for it; a backend that never
+# shows the upload still fails the push.
+HOME="$(new_home home_settle)"; omarchy-backup init >/dev/null 2>&1
+seed_workspace "$HOME"
+SM="$WORK/settle-mount"; SB="$WORK/settle-backend"; mkdir -p "$SM" "$SB"
+sed -i "s|^OB_CFG_REMOTE_PATH=.*|OB_CFG_REMOTE_PATH=$SM|" "$HOME/.config/omarchy-backup/config.conf"
+sed -i "s|^OB_CFG_INTEGRITY_RCLONE_REMOTE=.*|OB_CFG_INTEGRITY_RCLONE_REMOTE=$SB|" "$HOME/.config/omarchy-backup/config.conf"
+LAG_BIN="$WORK/lag-bin"; mkdir -p "$LAG_BIN"
+cat > "$LAG_BIN/rclone" <<LAG
+#!/bin/bash
+"$REAL_RCLONE" "\$@"; rc=\$?
+case "\$1" in copy|copyto|moveto|move) [ -f "$WORK/settle-frozen" ] || ( sleep 3; cp -a "$SM/." "$SB/" ) >/dev/null 2>&1 & ;; esac
+exit \$rc
+LAG
+chmod +x "$LAG_BIN/rclone"
+omarchy-backup snapshot s-1 >/dev/null 2>&1
+sl_rc=0; sl_out="$(PATH="$LAG_BIN:$PATH" OMARCHY_BACKUP_INTEGRITY_SETTLE_SECONDS=20 OMARCHY_BACKUP_INTEGRITY_SETTLE_POLL=1 omarchy-backup push s-1 2>&1)" || sl_rc=$?
+assert_eq "a lagging backend is waited for (push succeeds)" "0" "$sl_rc"
+assert_not_contains "nothing is reported as mismatched" "$sl_out" "does not match"
+assert_eq "the upload is recorded" "true" "$(jq '.snapshots | has("s-1")' "$HOME/.local/share/omarchy-backup/integrity-ledger.json")"
+assert_eq "the host-folder files are recorded" "true" "$(jq '.base.files | has("index.json")' "$HOME/.local/share/omarchy-backup/integrity-ledger.json")"
+sleep 4
+touch "$WORK/settle-frozen"
+sleep 1
+omarchy-backup snapshot s-2 >/dev/null 2>&1
+sf_rc=0; sf_out="$(PATH="$LAG_BIN:$PATH" OMARCHY_BACKUP_INTEGRITY_SETTLE_SECONDS=2 OMARCHY_BACKUP_INTEGRITY_SETTLE_POLL=1 omarchy-backup push s-2 2>&1)" || sf_rc=$?
+assert_eq "a backend that never shows the upload still fails the push" "75" "$sf_rc"
+assert_contains "the failed record is explained" "$sf_out" "treating it as not uploaded"
+assert_eq "the failed upload is not in the ledger" "false" "$(jq '.snapshots | has("s-2")' "$HOME/.local/share/omarchy-backup/integrity-ledger.json")"
+assert_eq "recorded entries carry an MD5 (strong check)" "true" \
+  "$(jq '[.snapshots["s-1"].files[] | .md5 | length == 32] | all' "$HOME/.local/share/omarchy-backup/integrity-ledger.json")"
+# A backend that shows a tampered file the whole time is never recorded,
+# however long recording waits.
+omarchy-backup snapshot s-3 >/dev/null 2>&1
+mkdir -p "$SB/$(hostname)/s-3"; cp "$HOME/.local/share/omarchy-backup/snapshots/s-3"/* "$SB/$(hostname)/s-3/"
+printf x >> "$SB/$(hostname)/s-3/payload.tar.zst"
+st_rc=0; st_out="$(PATH="$LAG_BIN:$PATH" OMARCHY_BACKUP_INTEGRITY_SETTLE_SECONDS=3 OMARCHY_BACKUP_INTEGRITY_SETTLE_POLL=1 omarchy-backup push s-3 2>&1)" || st_rc=$?
+assert_eq "a tampered backend file fails the push despite waiting" "75" "$st_rc"
+assert_contains "the tampered file is named" "$st_out" "s-3/payload.tar.zst does not match what was just uploaded"
+assert_eq "the tampered upload is not in the ledger" "false" "$(jq '.snapshots | has("s-3")' "$HOME/.local/share/omarchy-backup/integrity-ledger.json")"
+
 echo "== Summary: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]

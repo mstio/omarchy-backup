@@ -369,7 +369,12 @@ integrity reset` (the next push records the destination anew).
   would download every file, so only size + date are compared, and `doctor`
   says so. Set `OB_CFG_INTEGRITY_RCLONE_REMOTE` to the same folder as an
   rclone spec (e.g. `mydrive:backups/omarchy` when `mydrive:` is the
-  mounted remote) to get the MD5 check.
+  mounted remote) to get the MD5 check. The mount hands uploads to the
+  backend a few seconds later (rclone VFS write-back), so right after a push
+  recording waits until the backend shows exactly the uploaded files (up to
+  300 s, `OMARCHY_BACKUP_INTEGRITY_SETTLE_SECONDS`; poll every 5 s,
+  `OMARCHY_BACKUP_INTEGRITY_SETTLE_POLL`). It never accepts less: whatever
+  still differs then fails the push as before.
 - Plain local disk/NAS folder: hashed locally.
 - Uploads from before the ledger existed are listed by `doctor`; after
   checking one (`restore --dry-run` with signature verification), adopt it

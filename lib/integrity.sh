@@ -75,6 +75,32 @@ ob_integrity_target() {
   fi
 }
 
+# Right after an upload the integrity listing may lag behind it: with a
+# separate integrity remote the upload went through a mount (rclone VFS
+# write-back hands files to the backend seconds later, then uploads them).
+# Recording then waits -- up to this long -- until the destination shows
+# exactly what was uploaded; it never accepts less. 0 everywhere else
+# (listing = upload path). Once a wait ran out in this run, later ones do
+# not wait again (a backend that stays wrong must not stretch a push).
+OB_INTEGRITY_SETTLE_POLL_SECONDS="${OMARCHY_BACKUP_INTEGRITY_SETTLE_POLL:-5}"
+case "$OB_INTEGRITY_SETTLE_POLL_SECONDS" in ''|0|*[!0-9]*) OB_INTEGRITY_SETTLE_POLL_SECONDS=5 ;; esac
+OB_INTEGRITY_SETTLE_EXPIRED=false
+ob_integrity_settle_seconds() {
+  local s="${OMARCHY_BACKUP_INTEGRITY_SETTLE_SECONDS:-300}"
+  case "$s" in ''|*[!0-9]*) s=300 ;; esac
+  [ "$OB_INTEGRITY_SETTLE_EXPIRED" != true ] || s=0
+  if [ -z "${OB_CFG_REMOTE_NAME:-}" ] && [ -n "${OB_CFG_INTEGRITY_RCLONE_REMOTE:-}" ]; then echo "$s"; else echo 0; fi
+}
+
+# Like ob_integrity_entry_matches, but while still waiting a strong listing
+# without an MD5 (backend not done hashing) counts as "not there yet".
+ob_integrity_entry_settled() {  # <entry json> <local file> <mode> <still waiting: true|false>
+  if [ "$3" = strong ] && [ "$4" = true ] && [ -z "$(printf '%s' "$1" | jq -r '.md5 // ""' 2>/dev/null)" ]; then
+    return 1
+  fi
+  ob_integrity_entry_matches "$1" "$2"
+}
+
 # ob_integrity_list <spec> <mode> -> JSON {file:{size,md5,mtime}} of the
 # files directly in <spec>. rc 3: folder does not exist; rc 1: other error.
 # Times are listed in UTC, so a DST or time zone change is no "change".
@@ -112,20 +138,34 @@ ob_integrity_entry_matches() {  # <entry json> <local file>
 # only those: anything else in that folder stays "added" (a problem), even
 # if it was planted before the upload.
 ob_ledger_record() {  # <snapshot name>
-  local name="$1" spec mode listing f entry recorded='{}'
+  local name="$1" spec mode listing f entry recorded bad deadline waiting
   IFS=$'\t' read -r spec mode < <(ob_integrity_target)
-  listing="$(ob_integrity_list "$spec/$name" "$mode")" || {
-    ob_warn "Could not list '$name' on the destination; its integrity is not recorded."
-    return 1
-  }
-  for f in manifest.json manifest.json.sig checksums.sha256 payload.tar.zst; do
-    [ -f "$OB_SNAPSHOTS_DIR/$name/$f" ] || continue
-    entry="$(printf '%s' "$listing" | jq -c --arg f "$f" '.[$f] // null')"
-    if ! ob_integrity_entry_matches "$entry" "$OB_SNAPSHOTS_DIR/$name/$f"; then
-      ob_err "The destination's $name/$f does not match what was just uploaded; not recorded."
+  deadline=$(( $(date +%s) + $(ob_integrity_settle_seconds) ))
+  [ "$(ob_integrity_settle_seconds)" -gt 0 ] || deadline=0
+  while :; do
+    recorded='{}' bad="" waiting=false
+    [ "$(date +%s)" -lt "$deadline" ] && waiting=true
+    if listing="$(ob_integrity_list "$spec/$name" "$mode")"; then
+      for f in manifest.json manifest.json.sig checksums.sha256 payload.tar.zst; do
+        [ -f "$OB_SNAPSHOTS_DIR/$name/$f" ] || continue
+        entry="$(printf '%s' "$listing" | jq -c --arg f "$f" '.[$f] // null')"
+        ob_integrity_entry_settled "$entry" "$OB_SNAPSHOTS_DIR/$name/$f" "$mode" "$waiting" || { bad="$f"; break; }
+        recorded="$(printf '%s' "$recorded" | jq -c --arg f "$f" --argjson e "$entry" '.[$f] = $e')"
+      done
+    else
+      bad="(listing)"
+    fi
+    [ -n "$bad" ] || break
+    if [ "$waiting" != true ]; then
+      [ "$deadline" -gt 0 ] && OB_INTEGRITY_SETTLE_EXPIRED=true
+      if [ "$bad" = "(listing)" ]; then
+        ob_warn "Could not list '$name' on the destination; its integrity is not recorded."
+      else
+        ob_err "The destination's $name/$bad does not match what was just uploaded; not recorded."
+      fi
       return 1
     fi
-    recorded="$(printf '%s' "$recorded" | jq -c --arg f "$f" --argjson e "$entry" '.[$f] = $e')"
+    sleep "$OB_INTEGRITY_SETTLE_POLL_SECONDS"
   done
   ob_ledger_write "$(ob_ledger_read | jq --arg n "$name" --arg m "$mode" --arg t "$(date -Iseconds)" \
     --argjson files "$recorded" '.snapshots[$n] = {mode:$m, recorded_at:$t, files:$files}')"
@@ -186,14 +226,22 @@ ob_epoch() { date -d "$1" +%s 2>/dev/null || echo 0; }
 # tool copy, RECOVERY.md and their signatures): verified against the local
 # copy, then only that entry is updated. Never re-baselines the folder.
 ob_ledger_note_base() {  # <remote file name> <local file>
-  local fname="$1" local_file="$2" spec mode listing entry
+  local fname="$1" local_file="$2" spec mode listing entry deadline waiting
   IFS=$'\t' read -r spec mode < <(ob_integrity_target)
-  listing="$(ob_integrity_list "$spec" "$mode")" || return 1
-  entry="$(printf '%s' "$listing" | jq -c --arg f "$fname" '.[$f] // null')"
-  if ! ob_integrity_entry_matches "$entry" "$local_file"; then
-    ob_warn "The destination's $fname does not match what was just uploaded; not recorded."
-    return 1
-  fi
+  deadline=$(( $(date +%s) + $(ob_integrity_settle_seconds) ))
+  [ "$(ob_integrity_settle_seconds)" -gt 0 ] || deadline=0
+  while :; do
+    entry=null waiting=false
+    [ "$(date +%s)" -lt "$deadline" ] && waiting=true
+    listing="$(ob_integrity_list "$spec" "$mode")" && entry="$(printf '%s' "$listing" | jq -c --arg f "$fname" '.[$f] // null')"
+    ob_integrity_entry_settled "$entry" "$local_file" "$mode" "$waiting" && break
+    if [ "$waiting" != true ]; then
+      [ "$deadline" -gt 0 ] && OB_INTEGRITY_SETTLE_EXPIRED=true
+      ob_warn "The destination's $fname does not match what was just uploaded; not recorded."
+      return 1
+    fi
+    sleep "$OB_INTEGRITY_SETTLE_POLL_SECONDS"
+  done
   ob_ledger_write "$(ob_ledger_read | jq --arg f "$fname" --arg m "$mode" --argjson e "$entry" \
     '.base = ((.base // {mode:$m, files:{}}) | .mode = $m | .files[$f] = $e)')"
 }
