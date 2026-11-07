@@ -1259,6 +1259,38 @@ assert_contains "the README recipe verifies RECOVERY.md" \
   "$(ssh-keygen -Y verify -f "$WORK/allowed-readme" -I backup-signer -n omarchy-backup -s "$SXB/RECOVERY.md.sig" < "$SXB/RECOVERY.md" 2>&1)" "Good"
 assert_eq "the ledger covers the signed tool copy" "true" \
   "$(jq '.base.files | has("omarchy-backup-tool.tar.gz") and has("omarchy-backup-tool.tar.gz.sig") and has("RECOVERY.md.sig") and has("index.json")' "$HOME/.local/share/omarchy-backup/integrity-ledger.json")"
+echo "== never trust the destination: held-back path rules, refused files, review escapes =="
+RP="$(sign_into review_paths signed1)"
+rp_out="$(HOME="$RP" omarchy-backup restore signed1 --signer-github testsigner --yes < /dev/null 2>&1)"
+assert_file "the snapshot's paths.d drop-in is written as .restored" "$RP/.config/omarchy-backup/paths.d/self.conf.restored"
+assert_not_file "the snapshot's paths.d drop-in is not active" "$RP/.config/omarchy-backup/paths.d/self.conf"
+assert_contains "the review marks path rules as held back" "$rp_out" "written as self.conf.restored -- NOT activated"
+assert_not_contains "held-back files are not reported missing" "$rp_out" "Missing after restore: $RP/.config/omarchy-backup/paths.d"
+assert_file "the rest of the payload is restored" "$RP/.local/bin/mytool"
+# A hostile payload (accepted although unverified): secrets and the signing
+# key's path are never written; escape sequences are defused in the review.
+RS="$(sign_into review_refused signed1)"
+RSD="$RS/.local/share/omarchy-backup/snapshots/signed1"; RST="$WORK/rs-tree"; mkdir -p "$RST"
+zstd -q -d -c "$RSD/payload.tar.zst" | tar -x -C "$RST"
+mkdir -p "$RST/.config/someapp" "$RST/.config/omarchy-backup"
+echo "x" > "$RST/.config/someapp/api_token.txt"
+echo "planted" > "$RST/.config/omarchy-backup/backup-ident"
+printf 'visible\033[30;40mHIDDEN\033[0m\n' > "$RST/.config/someapp/readme.txt"
+mkdir -p "$RST/id_rsa-notes"; echo "todo" > "$RST/id_rsa-notes/todo.txt"   # a snapshot keeps this too
+printf 'PNG' > "$RST/.config/someapp/secret.png"
+tar -C "$RST" -c . | zstd -q -o "$WORK/rs-payload.tar.zst" && cp "$WORK/rs-payload.tar.zst" "$RSD/payload.tar.zst"
+jq --arg s "$(sha256sum < "$RSD/payload.tar.zst" | awk '{print $1}')" '.payload.sha256=$s' "$RSD/manifest.json" > "$WORK/rs.json" && cp "$WORK/rs.json" "$RSD/manifest.json"
+HOME="$RS" omarchy-backup config set OB_CFG_SIGNING_KEY "~/.config/omarchy-backup/backup-ident" >/dev/null 2>&1
+rs_out="$(HOME="$RS" omarchy-backup restore signed1 --signer-github testsigner --accept-unverified --yes < /dev/null 2>&1)"
+assert_not_file "a secret-looking payload file is not written" "$RS/.config/someapp/api_token.txt"
+assert_not_file "nothing is written at the signing key's path" "$RS/.config/omarchy-backup/backup-ident"
+assert_contains "the review flags refused files" "$rs_out" "IGNORED  ~/.config/someapp/api_token.txt"
+assert_contains "escape sequences are shown, not interpreted" "$rs_out" "visible^?[30;40mHIDDEN"
+assert_eq "no raw escape reaches the review file" "0" "$(cat "$RS"/.local/share/omarchy-backup/restore-review-*.txt | grep -c $'\033')"
+assert_file "ordinary files of the payload are still restored" "$RS/.config/someapp/readme.txt"
+assert_file "restore refuses only what a snapshot would have left out" "$RS/id_rsa-notes/todo.txt"
+assert_contains "a refused image is listed, not hidden as data" "$rs_out" "IGNORED  ~/.config/someapp/secret.png"
+assert_not_file "a refused image is not written" "$RS/.config/someapp/secret.png"
 unset OMARCHY_BACKUP_GITHUB_API
 
 echo "== never trust the destination: recording, adoption, pending uploads, staging =="

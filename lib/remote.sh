@@ -341,7 +341,10 @@ ob_remote_push_recovery_notes() {
 }
 
 # Uploads <local file> (signed with the snapshot key, if configured) to
-# <base>/<name>, then records both in the integrity ledger.
+# <base>/<name>, then records both in the integrity ledger. The tool copy and
+# RECOVERY.md are deliberately verified by hand (ssh-keygen -Y verify) before
+# use, not by the tool: a copy cannot vouch for itself (README, "Deliberate
+# limits").
 ob_remote_upload_signed() {  # <local file> <base> <remote name>
   local f="$1" base="$2" rname="$3"
   ob_sig_sign_file "$f" || true

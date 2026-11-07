@@ -447,6 +447,9 @@ ob_sig_keys_to_allowed() {
 # file), OB_SIG_GITHUB / OB_CFG_SIGNER_GITHUB (GitHub user's public signing
 # keys). Sets OB_SIG_ANCHOR to a description. rc 1: no anchor configured,
 # rc 2: anchor configured but unusable (network, no keys).
+# Deliberately every signing key of the account counts (no pin, no watch on
+# the key list); the user compares the printed fingerprint with a note kept
+# outside the backup. See README, "Deliberate limits".
 ob_sig_build_allowed() {
   local out="$1" file user json
   : > "$out"
@@ -504,6 +507,8 @@ ob_sig_verify() {
   fi
   rm -f -- "$allowed"
   # A valid signature covers manifest.json; manifest.json covers the rest.
+  # The folder name is deliberately not compared with the signed name (README,
+  # "Deliberate limits"); restore prints the signed creation date instead.
   if [ "$OB_SIG_RESULT" = verified ]; then
     local want have
     want="$(jq -r '.checksums_sha256 // ""' "$dir/manifest.json" 2>/dev/null)"
@@ -599,9 +604,16 @@ ob_review_excerpt() {  # <file> <lines>
   return 0
 }
 
+# File content and manifest strings reach a terminal (and `less -R`): control
+# characters (escape sequences that could hide or rewrite lines, carriage
+# returns, the C1 CSI) are shown as "^?" instead of being interpreted.
+ob_review_sanitize() {
+  LC_ALL=C sed -e 's/[\x00-\x08\x0b-\x1f\x7f]/^?/g' -e 's/\xc2[\x80-\x9f]/^?/g'
+}
+
 # ob_restore_review <unpacked tree> <manifest json> -> 0 continue, 1 stop.
 ob_restore_review() {
-  local tree="$1" manifest="$2" f rel kind new=0 changed=0 same=0 data=0 lines difflines
+  local tree="$1" manifest="$2" f rel kind new=0 changed=0 same=0 data=0 ignored=0 lines difflines why
   local report details groups sname
   sname="$(printf '%s' "$manifest" | jq -r '.name // "snapshot"')"
   sname="${sname//[^A-Za-z0-9._-]/_}"
@@ -610,6 +622,11 @@ ob_restore_review() {
   ( umask 077; : > "$report" )
   while IFS= read -r -d '' f; do
     rel="${f#"$tree"/}"
+    if why="$(ob_restore_refusal "$rel")"; then
+      ignored=$((ignored + 1))
+      echo "    IGNORED  ~/$rel  (NOT written: $(ob_restore_refusal_text "$why"))" >> "$details"
+      continue
+    fi
     if [ -L "$f" ]; then
       [ "$(readlink -- "$f")" = "$(readlink -- "$HOME/$rel" 2>/dev/null)" ] && { same=$((same + 1)); continue; }
     elif [ -f "$HOME/$rel" ] && [ ! -L "$HOME/$rel" ] && cmp -s -- "$f" "$HOME/$rel"; then
@@ -620,11 +637,17 @@ ob_restore_review() {
     if ob_review_is_data_only "$rel"; then data=$((data + 1)); continue; fi
     if ob_review_is_sensitive "$rel"; then lines=200; difflines=200; else lines=8; difflines=40; fi
     {
-      if [ -L "$f" ]; then
+      if ob_restore_is_held_back "$rel"; then
+        echo "    $kind  ~/$rel  (the tool's own config/path rules; $( [ -L "$f" ] && echo "a symlink, ignored" || echo "written as $(basename -- "$rel").restored") -- NOT activated)"
+        if [ -L "$f" ]; then
+          :
+        elif [ -f "$HOME/$rel" ]; then
+          diff -u --label "current" --label "snapshot" -- "$HOME/$rel" "$f" 2>/dev/null | sed 's/^/        /'
+        else
+          ob_review_excerpt "$f" 200
+        fi
+      elif [ -L "$f" ]; then
         echo "    $kind  ~/$rel -> $(readlink -- "$f")"
-      elif [ "$rel" = ".config/omarchy-backup/config.conf" ]; then
-        echo "    $kind  ~/$rel  (sourced as code; written as config.conf.restored, NOT activated)"
-        diff -u --label "current" --label "snapshot" -- "$HOME/$rel" "$f" 2>/dev/null | sed 's/^/        /'
       elif [ "$kind" = CHANGED ] && [ -f "$HOME/$rel" ] && grep -Iq . -- "$f" 2>/dev/null; then
         echo "    $kind  ~/$rel"
         diff -u --label "current" --label "snapshot" -- "$HOME/$rel" "$f" 2>/dev/null | head -n "$difflines" | sed 's/^/        /'
@@ -651,10 +674,10 @@ ob_restore_review() {
 
   {
     echo "== Review: what this restore would write, install and run =="
-    if [ $((new + changed)) -eq 0 ]; then
+    if [ $((new + changed + ignored)) -eq 0 ]; then
       echo "  No file would be added or changed ($same identical)."
     else
-      echo "  $new new and $changed changed file(s), $same identical; per folder:"
+      echo "  $new new and $changed changed file(s), $same identical$([ "$ignored" -gt 0 ] && echo ", $ignored IGNORED (never written, listed below)"); per folder:"
       awk -F'\t' '{n[$1]++; if ($2=="NEW") a[$1]++; else c[$1]++}
         END {for (d in n) printf "    %4d new %4d changed  ~/%s\n", a[d]+0, c[d]+0, d}' "$groups" | sort -k5
       [ "$data" -gt 0 ] && echo "  ($data of them are images/fonts, not shown in detail.)"
@@ -665,7 +688,7 @@ ob_restore_review() {
     [ -n "$units" ] && { echo "  systemd user units to enable/start:"; printf '%s\n' "$units"; }
     [ -n "$net" ] && { echo "  Code fetched from the network:"; printf '%s\n' "$net"; }
     true
-  } >> "$report"
+  } | ob_review_sanitize >> "$report"
   rm -f -- "$details" "$groups"
 
   echo
@@ -675,7 +698,7 @@ ob_restore_review() {
     cat -- "$report"
   fi
   echo
-  echo "  Summary: $new new, $changed changed, $same identical file(s)$([ -n "$pkgs" ] && echo ", packages to install")$([ -n "$units" ] && echo ", units to enable/start")$([ -n "$net" ] && echo ", code from the network")."
+  echo "  Summary: $new new, $changed changed, $same identical file(s)$([ "$ignored" -gt 0 ] && echo ", $ignored ignored")$([ -n "$pkgs" ] && echo ", packages to install")$([ -n "$units" ] && echo ", units to enable/start")$([ -n "$net" ] && echo ", code from the network")."
   echo "  Full review: $report"
   echo
   [ $((new + changed)) -eq 0 ] && [ -z "$pkgs" ] && [ -z "$units" ] && [ -z "$net" ] && return 0

@@ -27,14 +27,19 @@ create a self-consistent malicious snapshot. The tool exposes that boundary and
 provides `restore --dry-run`; it does not take ownership of the user's trust
 decision or forbid an explicitly requested restore.
 
+Since 2026-11-05 snapshots are signed and checked against a trust anchor
+outside the backup, the destination is compared with a local hash ledger,
+and restore shows everything before writing it. What these checks
+deliberately do not cover (and the manual check for each) is listed in
+README.md, "Deliberate limits". Reports that fall under those limits are
+welcome, but the answer may be "intended".
+
 Planned defense-in-depth work, in priority order:
 
-1. Optionally add detached signatures or a MAC whose trust key is kept
-   separately from the backup endpoint. Verification should give the user
-   stronger evidence and a clear warning, while an explicit user override must
-   remain possible. Authentication metadata must remain a detached sidecar: the
-   standard `tar.zst` payload must always stay manually readable without this
-   tool.
+1. Done (2026-11-05): detached SSH signatures (`manifest.json.sig`), trust
+   anchor outside the backup, loud warning with explicit override; the
+   `tar.zst` payload stays manually readable. See README, "Never trust the
+   destination".
 2. Extend restore-manifest plausibility checks beyond plugins. Plugin ids,
    remotes and commits are already validated and the pinned commit is checked
    out detached in a staging clone before `omarchy plugin add` or any enable

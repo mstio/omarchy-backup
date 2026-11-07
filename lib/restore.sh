@@ -749,23 +749,69 @@ ob_restore_unpack() {  # <stage> <manifest json>
 }
 
 # The tool's own config is bash-sourced and holds the trust anchor
-# (signer, allowed signers, signing key, integrity remote): a restored copy
-# never replaces the active one; it is written next to it for review.
-OB_RESTORE_HELD_BACK=".config/omarchy-backup/config.conf"
+# (signer, allowed signers, signing key, integrity remote), and its path
+# rules decide what the next automatic run uploads: a restored copy never
+# replaces the active one; it is written next to it as <file>.restored for
+# review (paths.d only reads *.conf, so a .restored copy stays inert).
+# Path rules and the refused files below: suggested by bernhard2804 (issue #1).
+ob_restore_is_held_back() {  # <relative path>
+  case "$1" in
+    .config/omarchy-backup/config.conf|.config/omarchy-backup/paths.conf) return 0 ;;
+    .config/omarchy-backup/paths.d/*) return 0 ;;
+  esac
+  return 1
+}
+
+# Payload files that are never written: names a snapshot filters out when
+# it is taken (matched as "/<rel>", like the absolute path then, so the two
+# agree whatever $HOME is) -- a genuine snapshot cannot contain them -- and
+# whatever sits at this machine's signing-key path.
+# ob_restore_refusal <relative path> -> prints "secret" / "key", rc 0; rc 1 if fine.
+OB_RESTORE_KEY_PATH=unset
+ob_restore_refusal() {
+  if ob_matches_any_glob "/$1" "${OB_SECRET_GLOBS[@]}"; then echo secret; return 0; fi
+  if [ "$OB_RESTORE_KEY_PATH" = unset ]; then
+    OB_RESTORE_KEY_PATH=""
+    [ -n "${OB_CFG_SIGNING_KEY:-}" ] && OB_RESTORE_KEY_PATH="$(ob_expand_path "$OB_CFG_SIGNING_KEY")"
+  fi
+  if [ -n "$OB_RESTORE_KEY_PATH" ] && { [ "$HOME/$1" = "$OB_RESTORE_KEY_PATH" ] \
+      || { [ -e "$OB_RESTORE_KEY_PATH" ] && [ "$HOME/$1" -ef "$OB_RESTORE_KEY_PATH" ]; }; }; then
+    echo key; return 0
+  fi
+  return 1
+}
+ob_restore_refusal_text() {  # <reason>
+  case "$1" in
+    secret) echo "named like a secret; a genuine snapshot never contains one -- treat the snapshot as suspect" ;;
+    *) echo "sits at this machine's signing-key path (OB_CFG_SIGNING_KEY)" ;;
+  esac
+}
 
 ob_restore_payload() {
   local tree="$1"
-  local f rel target
+  local f rel target held=0 why
   while IFS= read -r -d '' f; do
     rel="${f#"$tree"/}"
     target="$HOME/$rel"
-    if [ "$rel" = "$OB_RESTORE_HELD_BACK" ] && ! cmp -s -- "$f" "$target" 2>/dev/null; then
-      if [ "$OB_DRY_RUN" = "true" ]; then
-        echo "  [dry-run] would write $target.restored (active config.conf is kept)"
-      else
-        cp -a -- "$f" "$target.restored"
+    if why="$(ob_restore_refusal "$rel")"; then
+      ob_warn "Not restored: ~/$(printf '%q' "$rel") ($(ob_restore_refusal_text "$why"))."
+      ob_restore_note "Ignored ~/$(printf '%q' "$rel") from the snapshot: $(ob_restore_refusal_text "$why")."
+      continue
+    fi
+    if ob_restore_is_held_back "$rel"; then
+      if [ -L "$f" ] || [ ! -f "$f" ]; then
+        ob_restore_note "Ignored ~/$rel from the snapshot (expected a regular file)."
+        continue
       fi
-      ob_restore_note "The snapshot's ~/$rel was written as ~/$rel.restored and is NOT active (it is sourced as code and holds the trust settings). Compare: diff ~/$rel ~/$rel.restored -- adopt: mv ~/$rel.restored ~/$rel"
+      cmp -s -- "$f" "$target" 2>/dev/null && continue
+      if [ "$OB_DRY_RUN" = "true" ]; then
+        echo "  [dry-run] would write $target.restored (the active file is kept)"
+      else
+        mkdir -p -- "$(dirname -- "$target")"
+        cp --remove-destination -- "$f" "$target.restored"
+      fi
+      ob_restore_note "The snapshot's ~/$rel was written as ~/$rel.restored and is NOT active (the tool's own config and path rules decide what is trusted and uploaded). Compare: diff ~/$rel ~/$rel.restored -- adopt: mv ~/$rel.restored ~/$rel"
+      held=$((held + 1))
       continue
     fi
     if [ -e "$target" ] || [ -L "$target" ]; then
@@ -784,6 +830,8 @@ ob_restore_payload() {
     fi
   done < <(find "$tree" \( -type f -o -type l \) -print0)
   echo "  Payload restored to \$HOME (existing differing files backed up alongside themselves)."
+  [ "$held" -gt 0 ] && echo "  $held file(s) of the tool's own config/path rules $([ "$OB_DRY_RUN" = true ] && echo "would be ")written as *.restored, not activated (see manual steps): until adopted, automatic runs use the current rules."
+  return 0
 }
 
 # Names from the (untrusted) manifest reach pacman/yay/systemctl only if
@@ -842,7 +890,8 @@ ob_restore_verify() {
     case "$hash" in
       symlink:*) continue ;;
     esac
-    [ "$rel" = "$OB_RESTORE_HELD_BACK" ] && continue  # written as .restored
+    ob_restore_is_held_back "$rel" && continue  # written as .restored
+    ob_restore_refusal "$rel" >/dev/null && continue  # never written
     path="$HOME/$rel"
     if [ ! -f "$path" ]; then
       ob_warn "Missing after restore: $path"

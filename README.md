@@ -408,6 +408,12 @@ explicit "yes" -- or `--accept-unverified` in a non-interactive run. The
 decision stays yours; it is never silent. `doctor` warns while no key is
 configured or GitHub does not list it.
 
+**Note your key's fingerprint outside the backup** (password manager,
+paper): `ssh-keygen -lf ~/.config/omarchy-backup/signing_key.pub`. Every
+"Signature OK: ... key SHA256:..." line on restore names the key that
+signed; compare it with your note. That is the check for "someone added
+their own signing key to my GitHub account" -- see "Deliberate limits".
+
 One-time setup (the nightly run is non-interactive, so the key has no
 passphrase; it is never put into a snapshot, whatever it is called):
 
@@ -420,8 +426,10 @@ omarchy-backup config set OB_CFG_SIGNER_GITHUB <your-github-user>
 omarchy-backup doctor        # "Snapshot signatures  OK"
 ```
 
-Before unpacking the tool copy on a fresh machine (no tool installed yet),
-check it by hand against your GitHub signing keys:
+The tool copy and `RECOVERY.md` come from the destination like everything
+else, and the tool copy would run before anything else is checked: **verify
+them before you unpack or follow them**, by hand, against your GitHub
+signing keys:
 
 ```
 curl -s https://api.github.com/users/<you>/ssh_signing_keys | jq -r '.[].key' \
@@ -430,7 +438,8 @@ ssh-keygen -Y verify -f allowed -I backup-signer -n omarchy-backup \
   -s omarchy-backup-tool.tar.gz.sig < omarchy-backup-tool.tar.gz
 ```
 
-("Good ... signature" = genuine; the same works for `RECOVERY.md`.)
+("Good ... signature" = genuine, with the key's fingerprint -- compare it
+with your note; the same works for `RECOVERY.md`.)
 
 If the key is lost, snapshots signed with it still verify as long as the
 public key stays on GitHub; if it leaks, delete it there -- every snapshot
@@ -462,11 +471,54 @@ snapshot folder without `manifest.json` (an interrupted download) is moved
 aside as `<name>.stale-<time>` before the restore downloads it again;
 staging leftovers older than a day are cleaned up.
 
-The snapshot's own `~/.config/omarchy-backup/config.conf` is sourced as
-code and holds the trust settings, so it is never activated by a restore:
-it is written as `config.conf.restored` (its full diff is in the review);
-adopt it with `mv ~/.config/omarchy-backup/config.conf.restored
-~/.config/omarchy-backup/config.conf` after reading it.
+The tool's own configuration is never activated by a restore:
+`config.conf` is sourced as code and holds the trust settings, and
+`paths.conf` / `paths.d/*.conf` decide what the next automatic run uploads
+(a hostile `include` line could send files to the destination). Each is
+written as `<file>.restored` (the review shows its diff, or up to 200 lines);
+adopt them after reading, e.g. `mv ~/.config/omarchy-backup/config.conf.restored
+~/.config/omarchy-backup/config.conf`. Until then automatic runs use the
+current rules. A payload file named like a secret (the same name rules that keep
+secrets out of a snapshot, so a genuine snapshot cannot contain one) or
+sitting at this machine's signing-key path is never written.
+
+The review shows control characters in file content as `^?`, so an escape
+sequence in a snapshot cannot hide or rewrite lines on the terminal.
+
+### Deliberate limits
+
+The goal is a backup you can control yourself with plain tools -- no
+encryption, no key server, no extra services. The checks above stop at the
+points below **on purpose**; each has a manual check instead of more
+machinery. Please read these as design decisions, not oversights.
+
+- **No encryption.** The destination is meant to be your own (a cloud
+  folder or NAS only you use). Snapshots stay readable with stock
+  `zstd`/`tar`; secrets are kept out by name rules, credentials never go in.
+- **Every signing key on the GitHub account is trusted.** There is no
+  fingerprint pin and no watch on the account's key list. Whoever controls
+  your GitHub account (and can write to the destination) could sign a forged
+  snapshot. Manual check: the fingerprint note above, compared with the
+  "Signature OK" line. Protect the GitHub account (2FA) like the backup itself.
+- **The tool copy and `RECOVERY.md` are not verified by the tool.** A tool
+  copy cannot vouch for itself, and on a fresh machine nothing else is
+  installed yet. Manual check: `ssh-keygen -Y verify` as shown above before
+  unpacking -- or skip the tool copy and `git clone` this repository.
+- **A snapshot's folder name is not bound to its signature.** An old,
+  genuine snapshot could be offered under a newer name; it would verify. On
+  the machine that uploaded it the integrity ledger catches this. Elsewhere:
+  `restore` prints the signed creation date ("created ...") -- check it.
+  Against someone who can write to the destination, freshness cannot be
+  guaranteed anyway: they can simply delete the newer snapshots.
+- **An unverified snapshot you accept can run code.** Scripts, units, hooks
+  and shell config come back with it; the review shows them, but it cannot
+  judge them. Answer "yes" to an UNVERIFIED snapshot only if you know why it
+  is unverified.
+
+These limits and the hardening above (held-back path rules, refused secret
+files, escape-safe review, verify-first recovery steps) come from a review by
+[bernhard2804](https://github.com/bernhard2804)
+([#1](https://github.com/mstio/omarchy-backup/issues/1)).
 
 ## Restore (fresh Omarchy install -> your workspace)
 
@@ -490,7 +542,12 @@ below.
 **Without git or rclone**: every push also leaves a copy of this tool
 (`omarchy-backup-tool.tar.gz`) and your recovery notes (`RECOVERY.md`, see
 `OB_CFG_RECOVERY_NOTES`) next to the snapshots. On a fresh machine you can
-download both plus a snapshot folder from the destination in a browser, then:
+download both (with their `.sig` files) plus a snapshot folder from the
+destination in a browser. Prefer a fresh `git clone` of this repository over
+the tool copy whenever GitHub is reachable -- your signing keys live there
+anyway. Otherwise **first** verify the tool copy as shown under "Never trust
+the destination" (`ssh-keygen -Y verify ... -s omarchy-backup-tool.tar.gz.sig`)
+and continue only on "Good ... signature":
 
 ```
 tar -xzf omarchy-backup-tool.tar.gz -C ~/Projects && ~/Projects/omarchy-backup/install.sh
@@ -499,18 +556,16 @@ omarchy-backup restore <name> --dry-run --repos-from-snapshot --signer-github <y
 omarchy-backup restore <name> --repos-from-snapshot --signer-github <you>
 ```
 
-The tool copy itself comes from the destination too: check it before
-running it (the integrity ledger on the old machine, if it still exists,
-lists its MD5; otherwise prefer a fresh clone from GitHub).
+Without a good signature, do not run the tool copy (the integrity ledger
+on the old machine, if it still exists, also lists its MD5).
 
 Note: snapshots are stored per hostname (`<destination>/<hostname>/`), so
 give the fresh install the same hostname (or `hostnamectl set-hostname`)
 before `remote-list`. The destination does not have to be mounted yet: point
 `OB_CFG_REMOTE_NAME`/`OB_CFG_REMOTE_PATH` at the rclone remote for the
-restore; your own `paths.d/` comes back with the payload, your
-`config.conf` as `config.conf.restored` (adopt it after reading it, see
-"Never trust the destination"), together with the units that mount the
-destination again.
+restore; your own `config.conf`, `paths.conf` and `paths.d/` come back as
+`*.restored` (adopt them after reading, see "Never trust the destination");
+the units that mount the destination again come back with the payload.
 
 Note: any plugin the manifest lists as git-managed (`plugins.git_managed` --
 this includes not just third-party plugins but your own, once you `git
