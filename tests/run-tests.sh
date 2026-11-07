@@ -16,6 +16,12 @@ export OMARCHY_BACKUP_PUSH_RETRY_DELAY=0
 export OMARCHY_BACKUP_TEST_MODE=true
 REMOTE_STORAGE="$WORK/remote-storage"
 mkdir -p "$REMOTE_STORAGE"
+# Tests provoke alerts on purpose (tampered destination, failed uploads):
+# they must never reach the real desktop. A stub notify-send swallows them
+# for the whole suite; tests that check an alert put their own stub first.
+QUIET_BIN="$WORK/quiet-bin"; mkdir -p "$QUIET_BIN"
+printf '#!/bin/sh\nexit 0\n' > "$QUIET_BIN/notify-send"; chmod +x "$QUIET_BIN/notify-send"
+export PATH="$QUIET_BIN:$PATH"
 cat > "$RCLONE_CONFIG" <<EOF
 [testlocal]
 type = local
