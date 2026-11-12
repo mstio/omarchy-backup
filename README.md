@@ -492,6 +492,13 @@ encryption, no key server, no extra services. The checks above stop at the
 points below **on purpose**; each has a manual check instead of more
 machinery. Please read these as design decisions, not oversights.
 
+The rule behind them: omarchy-backup must not make your machine easier to
+attack than it would be without it. It does not try to defend against every
+way a backup could be tampered with. Where you keep your snapshots and what
+you choose to restore is your responsibility; the tool shows you what it
+finds (preview, warnings) instead of adding more protection layers. Someone
+who can already write to your home folder is out of scope.
+
 - **No encryption.** The destination is meant to be your own (a cloud
   folder or NAS only you use). Snapshots stay readable with stock
   `zstd`/`tar`; secrets are kept out by name rules, credentials never go in.
