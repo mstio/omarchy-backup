@@ -682,6 +682,12 @@ assert_contains "doctor flags a ~/.local/bin link into an undeclared checkout" "
 echo "repo ~/Projects/tool" > "$RSRC/.config/omarchy-backup/paths.d/repos.conf"
 doc_out="$(HOME="$RSRC" omarchy-backup doctor 2>&1)"
 assert_contains "doctor accepts the declared checkout" "$doc_out" "$(printf '%-28s %s' 'Own git checkouts' 'OK')"
+# A linked worktree of a declared checkout is covered by it.
+git -C "$RSRC/Projects/tool" worktree add -q -b live "$RSRC/.local/share/tool-live" 2>/dev/null
+ln -s "$RSRC/.local/share/tool-live/bin/tool" "$RSRC/.local/bin/tool-live"
+doc_out="$(HOME="$RSRC" omarchy-backup doctor 2>&1)"
+assert_contains "doctor accepts a worktree of a declared checkout" "$doc_out" "$(printf '%-28s %s' 'Own git checkouts' 'OK')"
+rm "$RSRC/.local/bin/tool-live"; git -C "$RSRC/Projects/tool" worktree remove --force "$RSRC/.local/share/tool-live"; git -C "$RSRC/Projects/tool" branch -q -D live
 # Tracked uncommitted edit + an unpushed commit-free state; plus an untracked file.
 echo "local tweak" >> "$RSRC/Projects/tool/bin/tool"
 echo "scratch" > "$RSRC/Projects/tool/notes.txt"

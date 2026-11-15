@@ -97,7 +97,8 @@ Handled separately, not via `paths.conf`:
   `doctor` warns about git repos whose history no backup covers (no remote
   or unpushed commits, not declared with `repo`), in the included folders
   and in `OB_CFG_REPO_SCAN_ROOTS` (default `~/Projects ~/Work`), and when a
-  `~/.local/bin` link points into a checkout that is not declared.
+  `~/.local/bin` link points into a checkout that is not declared (a
+  `git worktree` of a declared checkout counts as declared).
 - **AppImages**: only detected and listed (path + checksum) for you to
   re-fetch; not embedded (they're large, redistributable binaries).
 

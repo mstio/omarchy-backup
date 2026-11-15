@@ -238,9 +238,15 @@ ob_doctor_run() {
     case "$target" in "$HOME/.config/omarchy/plugins/"*) continue ;; esac
     top="$(git -C "$(dirname -- "$target")" rev-parse --show-toplevel 2>/dev/null)" || continue
     [ -n "$top" ] || continue
-    local declared=false
+    # A linked worktree (git worktree add) is covered by its main checkout:
+    # the history lives there, and the worktree can be re-added from it.
+    local main common
+    common="$(git -C "$top" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || common=""
+    main="$top"; case "$common" in */.git) main="$(readlink -f -- "${common%/.git}")" ;; esac
+    local declared=false rr
     for r in "${OB_REPOS[@]:-}"; do
-      [ "$(readlink -f -- "$r" 2>/dev/null)" = "$top" ] && declared=true && break
+      rr="$(readlink -f -- "$r" 2>/dev/null)"
+      { [ "$rr" = "$top" ] || [ "$rr" = "$main" ]; } && declared=true && break
     done
     [ "$declared" = true ] || undeclared["$top"]=1
   done
